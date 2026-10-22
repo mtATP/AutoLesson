@@ -1,5 +1,7 @@
 # AutoLesson
 
+让蓝色大肥鱼 Vibe Coding 了一个基于纯视觉的智慧树刷课脚本。
+
 基于**纯视觉**的智慧树（`studyvideoh5.zhihuishu.com`）网课自动观看脚本。
 
 不注入 JavaScript、不读取 DOM、不修改页面请求，只做三件事：
