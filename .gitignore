@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv.broken_*/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# 本地配置与密钥（开源仓库只提交 config.example.yaml）
+config.yaml
+.gui_config.yaml
+config.yaml.bak
+*.key
+*.pem
+*.secret
+
+# 运行产物 / 日志 / 临时截图
+runtime/
+runtime_*.png
+*.log
+*.tmp
+*.bak
+
+# 个人数据、平台快照、作业文档
+*.mhtml
+*.docx
+ExamProgram/
+
+# 本地备份包
+*.zip
+
+# 编辑器 / 操作系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地复刻调试页（不随开源仓库提供）
+复刻版智慧树网页/
+启动复刻测试页.bat
+打开长列表MHTML.bat

@@ -1,0 +1,13 @@
+numpy>=1.24
+opencv-python>=4.8
+mss>=9.0
+pyautogui>=0.9.54
+rapidocr>=3.0
+onnxruntime>=1.16
+requests>=2.31
+PyYAML>=6.0
+
+# 可选：按窗口标题自动聚焦（主要面向 Windows）
+pygetwindow>=0.0.9; sys_platform == "win32"
+# 可选：桌面通知。没有它时仍会使用控制台、声音和 Webhook
+plyer>=2.1

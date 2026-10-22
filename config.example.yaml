@@ -1,0 +1,188 @@
+# =============================================================================
+# AutoLesson 配置文件
+# 所有相对路径以本文件所在目录为基准。
+# 未写出的配置项使用 autolesson/config.py 中的默认值。
+# =============================================================================
+
+window:
+  # 运行前自动激活标题包含以下关键字的浏览器窗口（依赖可选包 pygetwindow）
+  focus: true
+  title_keywords: ["课程学习", "智慧树", "zhihuishu", "stuStudy"]
+  # 点击视频后等待页面加载的秒数
+  settle_seconds: 3.0
+
+layout:
+  # true: 通过 OCR 寻找右侧“目录”二字自动定位面板
+  # false: 直接用下面的比例/像素值
+  auto_calibrate: true
+  # 0 表示自动；如果自动定位不准，用 `python -m autolesson calibrate` 输出的值覆盖
+  panel_left: 0
+  panel_top: 0
+  # 自动定位失败时的回退比例
+  panel_left_ratio: 0.80
+  panel_top_ratio: 0.30
+  panel_right_margin: 0
+
+panel:
+  # 每页滚动量 = 90 × 绝对值（默认 450px），Windows 上负值向下
+  scroll_step: -5
+  # 滚动后最长等待目录稳定的时间；实际检测到稳定会提前结束
+  scroll_wait: 0.8
+  max_scrolls: 40
+  top_scroll_clicks: 18
+  # 标题位于时长上方约几个字高
+  row_title_gap: 2.5
+  min_title_chars: 2
+  # 0 = 自动（1.0 倍）；文字很小时可设为 1.3~1.5
+  ocr_upscale: 0.0
+  right_icon_width: 62
+
+ocr:
+  # ONNX Runtime 线程数。默认 1：单核跑 OCR，肯定不会占满所有 CPU。
+  # 觉得 OCR 慢、CPU 有余量时可调到 2~4，CPU 占用会相应上升。
+  intra_threads: 1
+  inter_threads: 1
+  # OpenCV 内部线程数（截图裁剪、形态学、连通域都是小任务）
+  cv_threads: 1
+  # OCR 检测网络最小边长。默认 416；736 会把小图大幅上采样，CPU 高且更慢。
+  det_limit_side: 416
+  # 网课界面文字均为水平方向；关闭方向分类器可减少一部分 CPU
+  use_cls: false
+
+player:
+  # 播放监控轮询间隔（秒）
+  poll_seconds: 4.0
+  # 通过轻微移动鼠标唤出播放器控件
+  controls_wiggle: true
+  # 暂停多少秒后点播放
+  pause_grace_seconds: 12.0
+  # 正在播放但进度不动多少秒后开始恢复
+  stall_timeout_seconds: 45.0
+  # 最多恢复几次，超过则停止并通知
+  max_recoveries: 3
+  # 多少次找不到进度条后判定异常
+  no_bar_timeout_seconds: 60.0
+  # 排除屏幕底部任务栏的高度比例，避免任务栏亮色/图标被误判成进度条
+  # 全屏播放且控制条贴底时可设为 0
+  bottom_margin_ratio: 0.05
+  # 进度达到该比例即视为播放结束
+  completion_ratio: 0.995
+  # 播放结束后等待平台写入完成状态
+  completion_grace_seconds: 6.0
+  # 网络中断时最多等待恢复的秒数
+  network_wait_seconds: 120.0
+  # 播放器总时长与目录预计时长允许的误差（秒）
+  expected_total_tolerance: 180
+  # 每隔多久核对一次左上角“第X章 X.X、标题”面包屑
+  breadcrumb_check_seconds: 90.0
+
+practice:
+  # 自动练习（平时测试）：只点“暂存作业”，绝不提交
+  # 题目截图交给多模态模型，模型名沿用 llm.model
+  answer_mode: image
+  # 0 = 不限制本次处理几个平时测试
+  max_tests: 0
+  # 每题点击/翻页后的等待
+  question_wait: 0.8
+  # 点击平时测试后等待新标签页加载
+  open_wait: 2.0
+  # 新标签页白屏/加载慢时最多等待多少秒，超时只重试，不判定完成
+  page_timeout: 30.0
+  # 页面未识别到题目数时的兜底
+  default_questions: 10
+
+quiz:
+  enabled: true
+  # auto: 文字题走 OCR，数学/公式/OCR 不完整时附带截图
+  # text: 永远只发文字；image: 永远附带截图
+  answer_mode: auto
+  # 题目显示不全时在弹窗内部滚动的次数与格数
+  max_scrolls: 8
+  scroll_step: -4
+  scroll_wait: 0.7
+  close_wait: 2.0
+  # 图片请求被接口拒绝时，是否自动降级为纯文本作答
+  image_fallback_text: true
+
+llm:
+  # 关闭或未配置 API Key 时进入无 LLM 模式：只允许 run 视频模式，
+  # 弹题随机选择；auto（列表）和 practice（测试）会被禁用。
+  enabled: true
+  # 默认 DeepSeek V4.1 Flash（API 模型名 deepseek-flash），原生支持文字 + 图片
+  # 也可换成任意 OpenAI 兼容接口，例如：
+  #   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  #   model: qwen-vl-max
+  #   vision_model: ""
+  # 旧模型名 deepseek-v4-flash / deepseek-v4-flash-vision-exp 仍被接受，
+  # 但官方建议统一使用 deepseek-flash。
+  base_url: "${LLM_BASE_URL:-https://api.deepseek.com}"
+  # 留空则从 api_key_env / LLM_API_KEY / OPENAI_API_KEY 读取
+  api_key: ""  # 不要提交真实 Key；填写后仅保存在本机
+  api_key_env: DEEPSEEK_API_KEY
+  model: "${LLM_MODEL:-deepseek-flash}"
+  # 留空 = 与 model 相同（V4.1 Flash 原生多模态）
+  vision_model: "${LLM_VISION_MODEL:-}"
+  temperature: 0.0
+  max_tokens: 400
+  timeout: 90
+  max_retries: 2
+  # 大模型返回空内容/无法解析时再重试的次数
+  empty_retries: 2
+  empty_retry_wait: 1.0
+  # 视频弹题默认随机兜底：LLM 连续失败后随机选一个可见选项，继续观看。
+  # 练习模式不使用随机兜底，失败只跳过、不选择。
+  fallback_random_enabled: true
+  # DeepSeek 原生 JSON 输出；接口不支持时自动去掉 response_format 重试
+  json_mode: true
+  # 弹题只求快速答案，默认关闭 thinking；改 true 可开启深度思考
+  # 开启 thinking 时建议把 max_tokens 调到 800~1200，避免 JSON 被推理过程截断
+  thinking: false
+  # 按题目哈希缓存答案，同一道题不会重复消耗 token
+  cache: true
+  image_max_width: 1100
+  # 长题多屏截图：最多提交几张（每张单独编码，按从上到下顺序）
+  max_images: 8
+  image_jpeg_quality: 82
+
+overlay:
+  # 浅色弹窗检测阈值（0-255），越低越灵敏
+  card_threshold: 225
+  card_close_kernel: 15
+  max_cards: 3
+  # 启动时收起 AI 助教弹窗/悬浮球，并把竖直标签拖到上方
+  ai_assistant_cleanup: true
+
+notify:
+  desktop: true
+  sound: true
+  # 通用 Webhook；也支持 Server酱 / Telegram
+  # Server酱: webhook_type=serverchan, webhook_url=https://sctapi.ftqq.com/你的SendKey.send
+  # Telegram: webhook_type=telegram, 再填 telegram_bot_token / telegram_chat_id
+  webhook_url: "${AL_NOTIFY_WEBHOOK:-}"
+  webhook_type: generic
+  telegram_bot_token: "${AL_TELEGRAM_BOT_TOKEN:-}"
+  telegram_chat_id: "${AL_TELEGRAM_CHAT_ID:-}"
+  dedup_seconds: 60
+
+runtime:
+  state_file: runtime/state.json
+  log_dir: runtime/logs
+  shot_dir: runtime/shots
+  # true 时只分析屏幕，不点击（用于验证识别是否准确）
+  dry_run: false
+  # 0 = 不限制；也可在命令行用 --max-lessons/--max-minutes 临时覆盖
+  max_lessons: 0
+  max_minutes: 0
+  # 同一视频连续失败几次后停止；2 表示失败后立即重试同一个视频一次
+  max_lesson_attempts: 2
+  # 全局停止热键（Windows 原生 RegisterHotKey，浏览器前台也有效）
+  # 支持 F1~F12 / ESC / PAUSE；按一下即可安全停止并生成中止截图
+  stop_hotkey: "F9"
+  # 多显示器时指定编号，从 1 开始
+  monitor: 1
+
+safety:
+  # 鼠标移到屏幕左上角立即中止（pyautogui FAILSAFE）
+  fail_safe_corner: true
+  # 两次鼠标操作的最小间隔
+  min_action_interval: 0.05
