@@ -41,6 +41,10 @@ class HotkeyListener:
         stop_event: threading.Event,
         log: Any,
         extra_keys: Optional[list[str]] = None,
+        hotkey_id: int = HOTKEY_ID,
+        on_press=None,
+        once: bool = True,
+        label: str = "停止",
     ):
         self.key = str(key or "F9").strip().upper()
         self.extra_keys = [
@@ -51,6 +55,10 @@ class HotkeyListener:
         self.keys = [self.key] + self.extra_keys
         self.stop_event = stop_event
         self.log = log
+        self.hotkey_id = int(hotkey_id)
+        self.on_press = on_press
+        self.once = bool(once)
+        self.label = str(label or "停止")
         self._thread: Optional[threading.Thread] = None
         self._thread_id: Optional[int] = None
         self._registered = False
@@ -62,11 +70,11 @@ class HotkeyListener:
 
     def start(self) -> None:
         if sys.platform != "win32":
-            self.log.info("全局停止热键仅支持 Windows；当前请用 Ctrl+C 停止")
+            self.log.info("全局%s热键仅支持 Windows；当前请用 Ctrl+C 停止", self.label)
             return
         if parse_hotkey(self.key) is None:
             self.log.warning(
-                "无法识别停止热键 %r，已禁用（支持 F1~F12/ESC/PAUSE）", self.key
+                "无法识别%s热键 %r，已禁用（支持 F1~F12/ESC/PAUSE）", self.label, self.key
             )
             return
         if self._thread is not None and self._thread.is_alive():
@@ -112,6 +120,12 @@ class HotkeyListener:
             hook_thread.join(timeout=1.0)
 
     def _on_hotkey(self, key: Optional[str] = None) -> None:
+        if self.on_press is not None:
+            try:
+                self.on_press(key or self.key)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("%s热键回调异常: %s", self.label, exc)
+            return
         if not self.stop_event.is_set():
             self.log.warning("收到停止热键 %s，正在安全停止...", key or self.key)
             self.stop_event.set()
@@ -204,18 +218,26 @@ class HotkeyListener:
             return
         user32 = ctypes.windll.user32
         self._thread_id = int(ctypes.windll.kernel32.GetCurrentThreadId())
-        if not user32.RegisterHotKey(None, self.HOTKEY_ID, MOD_NOREPEAT, vk):
+        if not user32.RegisterHotKey(None, self.hotkey_id, MOD_NOREPEAT, vk):
             self.log.warning(
-                "全局停止热键 %s 注册失败（可能被其他程序占用）；"
-                "请用 Ctrl+C 或修改 runtime.stop_hotkey",
+                "全局%s热键 %s 注册失败（可能被其他程序占用）；"
+                "请用 Ctrl+C 或修改 runtime.stop_hotkey/pause_hotkey",
+                self.label,
                 self.key,
             )
             return
         self._registered = True
         self._ready.set()
-        self.log.info(
-            "全局停止热键已启用：按 %s 可随时安全停止（浏览器前台也有效）", self.key
-        )
+        if self.on_press is None:
+            self.log.info(
+                "全局停止热键已启用：按 %s 可随时安全停止（浏览器前台也有效）", self.key
+            )
+        else:
+            self.log.info(
+                "全局%s热键已启用：按 %s 可随时暂停/继续（浏览器前台也有效）",
+                self.label,
+                self.key,
+            )
         msg = wintypes.MSG()
         try:
             while not self.stop_event.is_set():
@@ -224,13 +246,14 @@ class HotkeyListener:
                     break
                 if msg.message == WM_HOTKEY:
                     self._on_hotkey(self.key)
-                    break
+                    if self.once:
+                        break
         except Exception as exc:  # noqa: BLE001
             self.log.warning("全局停止热键异常: %s", exc)
         finally:
             if self._registered:
                 try:
-                    user32.UnregisterHotKey(None, self.HOTKEY_ID)
+                    user32.UnregisterHotKey(None, self.hotkey_id)
                 except Exception:  # noqa: BLE001
                     pass
                 self._registered = False

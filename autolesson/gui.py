@@ -98,9 +98,12 @@ class App(tk.Tk):
         self.proc: Optional[subprocess.Popen] = None
         self.log_queue: queue.Queue[str] = queue.Queue()
         self._stop_sent = False
+        self._paused = False
+        self._run_mode = ""
         self._bar: Optional[tk.Toplevel] = None
         self._bar_status: Optional[tk.Label] = None
         self._bar_log: Optional[tk.Label] = None
+        self._bar_pause_btn: Optional[tk.Button] = None
         self._bar_hide_job: Optional[str] = None
         self._build_style()
         self._build_header()
@@ -168,6 +171,10 @@ class App(tk.Tk):
             top, text="停止 (F9/ESC)", command=self.stop, style="Danger.TButton"
         )
         self.stop_btn.pack(side="right")
+        self.pause_btn = ttk.Button(
+            top, text="暂停 (F8)", command=self.toggle_pause, state="disabled"
+        )
+        self.pause_btn.pack(side="right", padx=6)
         self.start_btn = ttk.Button(
             top, text="开始", command=self.start, style="Run.TButton"
         )
@@ -314,6 +321,9 @@ class App(tk.Tk):
         if self.proc is not None:
             messagebox.showwarning("正在运行", "请先停止当前任务再重新载入配置。")
             return
+        # 置顶小条也是 root 的 Toplevel 子窗口；重建界面时必须先清掉引用
+        if self._bar is not None:
+            self._hide_bar()
         self.data = self._load_raw()
         for child in self.winfo_children():
             child.destroy()
@@ -352,6 +362,11 @@ class App(tk.Tk):
             except queue.Empty:
                 break
             self._append_log(line)
+            text = (line or "").strip()
+            if text and "已暂停" in text and "热键" not in text:
+                self._set_paused_ui(True)
+            elif text and "继续运行" in text:
+                self._set_paused_ui(False)
         self.after(120, self._drain_log)
 
     # ------------------------------------------------------------------ 运行
@@ -407,8 +422,11 @@ class App(tk.Tk):
             messagebox.showerror("启动失败", str(exc))
             return
         self._stop_sent = False
+        self._run_mode = mode
+        self._paused = False
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
+        self._set_paused_ui(False)
         self.status_var.set(f"运行中：{MODES[mode][0]}")
         self._set_bar_status(f"运行中：{MODES[mode][0]}")
         self._cancel_bar_autohide()
@@ -442,11 +460,81 @@ class App(tk.Tk):
         self._cleanup_tmp_config()
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self._paused = False
+        if self.pause_btn is not None:
+            self.pause_btn.configure(state="disabled", text=f"暂停 ({self._pause_hotkey()})")
+        if self._bar_pause_btn is not None:
+            self._bar_pause_btn.configure(state="disabled", text="暂停")
         self.status_var.set(f"已结束（退出码 {code}）")
         self._set_bar_status(f"已结束（{code}）")
         # 任务结束后小条自动收起，避免一直挡在屏幕顶部；10 秒内重新开始会取消。
         if self._bar is not None:
             self._schedule_bar_autohide(10000)
+
+    def _pause_hotkey(self) -> str:
+        runtime = self.data.get("runtime", {}) if isinstance(self.data, dict) else {}
+        return str(runtime.get("pause_hotkey", "F8") or "F8").strip().upper()
+
+    def _pause_available(self) -> bool:
+        runtime = self.data.get("runtime", {}) if isinstance(self.data, dict) else {}
+        key = self._pause_hotkey()
+        if parse_hotkey(key) is None:
+            return False
+        stop_key = str(runtime.get("stop_hotkey", "F9") or "F9").strip().upper()
+        extras = [
+            str(k).strip().upper()
+            for k in (runtime.get("extra_stop_hotkeys") or ["ESC"])
+        ]
+        return key != stop_key and key not in extras
+
+    def toggle_pause(self) -> None:
+        """给子进程发一次暂停热键；实际状态以子进程日志为准。"""
+        if self.proc is None:
+            return
+        if not self._pause_available():
+            self.status_var.set("暂停热键不可用（与停止键冲突或无法识别）")
+            self._set_bar_status("暂停热键不可用")
+            return
+        runtime = self.data.get("runtime", {}) if isinstance(self.data, dict) else {}
+        vk = parse_hotkey(str(runtime.get("pause_hotkey", "F8"))) or 0x77
+        try:
+            user32 = ctypes.windll.user32
+            user32.keybd_event(vk, 0, 0, 0)
+            user32.keybd_event(vk, 0, 2, 0)
+        except Exception:  # noqa: BLE001
+            pass
+        self.status_var.set("正在继续…" if self._paused else "正在暂停…")
+        self._set_bar_status(self.status_var.get())
+        # 防连点：1.2 秒后按子进程日志同步真实状态并恢复按钮
+        if self.pause_btn is not None:
+            self.pause_btn.configure(state="disabled")
+        if self._bar_pause_btn is not None:
+            self._bar_pause_btn.configure(state="disabled")
+        self.after(1200, lambda: self._set_paused_ui(self._paused))
+
+    def _set_paused_ui(self, paused: bool) -> None:
+        self._paused = bool(paused)
+        key = self._pause_hotkey()
+        enabled = self.proc is not None and self._pause_available()
+        if self.pause_btn is not None:
+            self.pause_btn.configure(
+                text=(f"继续 ({key})" if paused else f"暂停 ({key})"),
+                state=("normal" if enabled else "disabled"),
+            )
+        if self._bar_pause_btn is not None:
+            self._bar_pause_btn.configure(
+                text=("继续" if paused else "暂停"),
+                state=("normal" if enabled else "disabled"),
+                bg=("#166534" if paused else "#92400e"),
+            )
+        if self.proc is not None:
+            if paused:
+                self.status_var.set(f"已暂停（{key} 继续）")
+                self._set_bar_status(f"已暂停（{key} 继续）")
+            elif self._run_mode:
+                label = MODES.get(self._run_mode, ("运行中", ""))[0]
+                self.status_var.set(f"运行中：{label}")
+                self._set_bar_status(f"运行中：{label}")
 
     def stop(self) -> None:
         if self.proc is None:
@@ -512,6 +600,7 @@ class App(tk.Tk):
         self._bar = None
         self._bar_status = None
         self._bar_log = None
+        self._bar_pause_btn = None
         self.bar_var.set(False)
 
     def _toggle_bar(self) -> None:
@@ -530,7 +619,7 @@ class App(tk.Tk):
         bar.overrideredirect(True)
         bar.attributes("-topmost", True)
         bar.configure(bg="#1f2937")
-        width = 720
+        width = 820
         x = max(0, (self.winfo_screenwidth() - width) // 2)
         bar.geometry(f"{width}x66+{x}+8")
         top = tk.Frame(bar, bg="#1f2937")
@@ -553,6 +642,11 @@ class App(tk.Tk):
             top, text="停止", command=self.stop, bg="#7f1d1d", fg="white",
             relief="flat", padx=12,
         ).pack(side="right", padx=(6, 0))
+        self._bar_pause_btn = tk.Button(
+            top, text="暂停", command=self.toggle_pause, bg="#92400e", fg="white",
+            relief="flat", padx=12,
+        )
+        self._bar_pause_btn.pack(side="right", padx=(6, 0))
         tk.Button(
             top, text="开始", command=self.start, bg="#166534", fg="white",
             relief="flat", padx=12,
@@ -563,6 +657,7 @@ class App(tk.Tk):
         )
         self._bar_log.pack(fill="x", padx=8, pady=(4, 5))
         self._bar = bar
+        self._set_paused_ui(self._paused)
         # 未运行时打开小条：2 分钟无操作自动收起；开始任务会取消定时器。
         if self.proc is None:
             self._schedule_bar_autohide(120000)

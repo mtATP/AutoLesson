@@ -155,6 +155,7 @@ class PracticePage:
         logger: Any = None,
         stop_event=None,
         notifier=None,
+        pause_event=None,
     ):
         self.ocr = ocr
         self.cfg = cfg
@@ -165,10 +166,16 @@ class PracticePage:
         self.log = logger or log
         self.stop_event = stop_event
         self.notifier = notifier
+        self.pause_event = pause_event
         self.answer_mode = str(getattr(cfg.practice, "answer_mode", "image"))
 
     # ------------------------------------------------------------------ 基础
     def _stopped(self) -> bool:
+        if self.pause_event is not None:
+            while self.pause_event.is_set():
+                if self.stop_event is not None and self.stop_event.is_set():
+                    return True
+                time.sleep(0.15)
         return bool(self.stop_event is not None and self.stop_event.is_set())
 
     def _read(self, frame: np.ndarray, upscale: float = 1.0) -> list[OcrLine]:
@@ -1161,6 +1168,7 @@ class PracticeRunner:
         logger: Any = None,
         stop_event=None,
         notifier=None,
+        pause_event=None,
     ):
         self.ocr = ocr
         self.cfg = cfg
@@ -1172,9 +1180,15 @@ class PracticeRunner:
         self.log = logger or log
         self.stop_event = stop_event
         self.notifier = notifier
+        self.pause_event = pause_event
         self.scanner = PracticeScanner(ocr, cfg)
 
     def _stopped(self) -> bool:
+        if self.pause_event is not None:
+            while self.pause_event.is_set():
+                if self.stop_event is not None and self.stop_event.is_set():
+                    return True
+                time.sleep(0.15)
         return bool(self.stop_event is not None and self.stop_event.is_set())
 
     def run(self, max_tests: int = 0) -> dict:
@@ -1222,6 +1236,7 @@ class PracticeRunner:
                 self.log.getChild("page"),
                 self.stop_event,
                 notifier=self.notifier,
+                pause_event=self.pause_event,
             )
             try:
                 result = page.run(close_tab=True)

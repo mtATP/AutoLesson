@@ -133,6 +133,7 @@ def parse_quiz(
     options: dict[str, str] = {}
     rects: dict[str, Rect] = {}
     option_lines: list[tuple[OcrLine, str, str]] = []
+    label_only: set[str] = set()
     for line in inside:
         m = OPTION_RE.match(line.text)
         if not m:
@@ -154,13 +155,25 @@ def parse_quiz(
                 other = min(candidates, key=lambda ln: ln.rect.x0)
                 text = other.text.strip()
                 rect = rect.union(other.rect)
+                label_only.discard(letter)
         option_lines.append((line, letter, text))
         if text:
+            label_only.discard(letter)
             if letter not in options or len(text) > len(options[letter]):
                 options[letter] = text
                 rects[letter] = rect
             elif letter in rects:
                 rects[letter] = rects[letter].union(rect)
+        else:
+            # 纯图片选项（选项正文是图片，只有 "A." "B." 标签）以前会被丢掉，
+            # 整道题因此变成“0 个选项”而直接失败。这里保留字母和圆点位置，
+            # 后续按视觉模式把弹窗截图交给大模型，仍能按 A/B 作答和点选。
+            options.setdefault(letter, "")
+            label_only.add(letter)
+            if letter in rects:
+                rects[letter] = rects[letter].union(rect)
+            else:
+                rects[letter] = rect
 
     option_y = min((ln.cy for ln, _, _ in option_lines), default=None)
     option_x = min((rects[k].x0 for k in rects), default=dialog.x0 + int(0.1 * dialog.width))
@@ -185,6 +198,10 @@ def parse_quiz(
                     if previous is None or rect.y1 > rects[previous].y1:
                         previous = letter
             if previous is not None:
+                if previous in label_only:
+                    # 图片选项的内容是图片，OCR 从图里读出的零散公式不是选项文字，
+                    # 更不能把圆点位置往下拉；保持标签位置，选中时点圆点。
+                    continue
                 options[previous] = _join_text([options[previous], line.text])
                 rects[previous] = rects[previous].union(line.rect)
 
@@ -517,19 +534,41 @@ class QuizHandler:
                     pass
         images.append(image)
 
+    def _trial_scroll_moves(self, dialog: Rect) -> bool:
+        """向下试滚一小段，判断弹窗里是否还有没露出来的内容。
+
+        长题可能首屏只露出 A/B，但 C/D 在滚动区下方；只看“首屏完整”
+        就会把二选项题做死。试滚一次没有位移，才认为一页能显示完。
+        """
+        step = max(140, min(260, int(0.22 * dialog.height)))
+        before = self._dialog_signature(self.screen.grab(), dialog)
+        self._wheel_pixels(dialog, step, -1)
+        time.sleep(max(0.40, min(0.70, float(self.cfg.quiz.scroll_wait))))
+        after = self._dialog_signature(self.screen.grab(), dialog)
+        moved = vision.signature_distance(before, after) > 6
+        if moved:
+            self.scroll_to_top(dialog)
+        return moved
+
     def collect(self, dialog: Rect) -> QuizQuestion:
-        """先读首屏；完整就直接返回，不完整才用滚轮向下滚动并拼接完整长图。"""
-        # 正确率优先：不再因为“看到了一个选项+关闭按钮”就跳过滚动。
-        # 回到顶部后慢速逐屏扫描，长图题/三选项题都能完整收集。
+        """先试滚一屏确认没有隐藏选项；有隐藏内容则逐屏扫描并拼接长图。"""
         self.scroll_to_top(dialog)
         frame = self.screen.grab()
         first, first_lines = self._read_with_lines(frame, dialog)
-        if self._complete(first, first_lines, dialog):
-            body = self._body_image(frame, dialog)
-            self._last_images = [body]
-            self._last_stitched = body
-            self.log.info("弹题首屏完整，单图提交: %s", sorted(first.options))
+        first_body = self._body_image(frame, dialog)
+        complete = self._complete(first, first_lines, dialog)
+        if complete and not self._trial_scroll_moves(dialog):
+            self._last_images = [first_body]
+            self._last_stitched = first_body
+            self.log.info("弹题试滚动无变化，单图提交: %s", sorted(first.options))
             return first
+        self.log.info(
+            "弹题需滚动收集（首屏%s），避免长题只按 A/B 两个选项作答",
+            "完整但可滚动" if complete else "不完整",
+        )
+        # 试滚有位移（或首屏本就不完整）：回到顶部后慢速逐屏扫描。
+        # _trial_scroll_moves 已经恢复顶部；首屏不完整时也仍在顶部。
+        frame = self.screen.grab()
         merged = self.read(frame, dialog)
         seen_sig = self._dialog_signature(frame, dialog)
         best_text = merged.text
@@ -783,18 +822,23 @@ class QuizHandler:
         page = self.read(frame, dialog)
         return page.option_rects.get(letter)
 
+    @staticmethod
+    def _option_visible(dialog: Rect, rect: Optional[Rect]) -> bool:
+        if rect is None:
+            return False
+        return (
+            rect.y0 > dialog.y0 + int(0.08 * dialog.height)
+            and rect.y1 < dialog.y1 - int(0.03 * dialog.height)
+        )
+
     def _scroll_until_option(self, dialog: Rect, letter: str) -> Optional[Rect]:
-        # 与 collect 同一套策略：大步长、短等待、滚轮无效时拖滚动条到底
+        # 第一遍：大步长 + 常规 OCR，快
         step = max(300, min(600, abs(int(self.cfg.quiz.scroll_step)) * 90))
         wait = min(0.35, float(self.cfg.quiz.scroll_wait))
         unchanged = 0
         for _ in range(max(16, int(self.cfg.quiz.max_scrolls))):
             rect = self._option_rect_current(dialog, letter)
-            if (
-                rect is not None
-                and rect.y0 > dialog.y0 + 0.10 * dialog.height
-                and rect.y1 < dialog.y1 - 0.04 * dialog.height
-            ):
+            if self._option_visible(dialog, rect):
                 return rect
             before = self.screen.grab()
             sig_before = self._dialog_signature(before, dialog)
@@ -804,15 +848,108 @@ class QuizHandler:
             if vision.signature_distance(sig_before, sig_after) <= 12:
                 unchanged += 1
                 if unchanged >= 2:
-                    return rect
+                    break
+            else:
+                unchanged = 0
+        # 大步长可能正好把夹在两屏之间的选项翻过去（例如 A 之后直接看到 C/D，
+        # B 被滚到可视区上方）。回到顶部，用小步长 + 高倍 OCR 再扫一遍。
+        self.log.info("选项 %s 常规扫描未找到，回到顶部小步长重扫", letter)
+        self.scroll_to_top(dialog)
+        return self._fine_scan_option(dialog, letter)
+
+    def _fine_scan_option(self, dialog: Rect, letter: str) -> Optional[Rect]:
+        """小步长逐屏寻找选项，避免大步长跨过目标行。"""
+        step = max(90, min(160, int(0.20 * dialog.height)))
+        wait = max(0.30, min(0.45, float(self.cfg.quiz.scroll_wait)))
+        unchanged = 0
+        for _ in range(max(20, int(self.cfg.quiz.max_scrolls) * 2)):
+            frame = self.screen.grab()
+            rect = self._option_rows(frame, dialog).get(letter)
+            if self._option_visible(dialog, rect):
+                self.log.info("小步长重扫找到选项 %s @ %s", letter, rect)
+                return rect
+            before = self._dialog_signature(frame, dialog)
+            self._wheel_pixels(dialog, step, -1)
+            time.sleep(wait)
+            after = self._dialog_signature(self.screen.grab(), dialog)
+            if vision.signature_distance(before, after) <= 8:
+                unchanged += 1
+                if unchanged >= 2:
+                    break
             else:
                 unchanged = 0
         return None
 
+    def _option_rows(self, frame: np.ndarray, dialog: Rect) -> dict[str, Rect]:
+        """点击前再高倍读一遍弹窗，返回 {字母: 标签矩形}。
+
+        选项正文是图片/公式时，第一次 OCR 可能漏字母或把字母算到相邻行；
+        这里用更高倍数重新识别，作为选项按钮位置的二次校验。
+        """
+        scale = min(2.2, 2200.0 / max(1, dialog.width))
+        try:
+            lines = self.ocr.read(
+                dialog.crop(frame), offset=(dialog.x0, dialog.y0), upscale=scale
+            )
+            page = parse_quiz(lines, dialog, frame, "text")
+        except Exception as exc:  # noqa: BLE001
+            self.log.debug("选项位置复核 OCR 失败: %s", exc)
+            return {}
+        return {
+            str(letter).upper(): rect
+            for letter, rect in page.option_rects.items()
+            if str(letter).upper() in "ABCDEFGH"
+        }
+
+    def _verify_option_row(
+        self, dialog: Rect, letter: str, planned: Optional[Rect], strict: bool = False
+    ) -> Optional[Rect]:
+        """点击前复核目标字母的实际行，避免大模型选 C 却点到 D。
+
+        以高倍整卡 OCR 的字母行为准；如果计划的那一行实际是别的字母，
+        宁可报错也不盲点相邻选项。strict 用于“按行距推算出来的位置”：
+        二次 OCR 没找到目标字母时直接拒绝，不再盲点。
+        """
+        frame = self.screen.grab()
+        rows = self._option_rows(frame, dialog)
+        target = rows.get(letter)
+        if target is not None:
+            if planned is not None and abs(target.cy - planned.cy) > max(8, target.height):
+                self.log.info(
+                    "选项 %s 位置复核: OCR 行 %s，原计划 %s，改用 OCR 行",
+                    letter,
+                    target,
+                    planned,
+                )
+            return target
+        if not rows:
+            if strict:
+                self.log.warning("选项 %s 位置复核失败: 未识别到任何选项行，拒绝盲点", letter)
+                return None
+            return planned
+        if planned is not None:
+            near_letter, near_rect = min(
+                rows.items(), key=lambda item: abs(item[1].cy - planned.cy)
+            )
+            if abs(near_rect.cy - planned.cy) <= max(10, int(0.6 * near_rect.height)):
+                self.log.warning(
+                    "选项 %s 位置复核未通过: 计划行 %d 实际是 %s，拒绝盲点",
+                    letter,
+                    planned.cy,
+                    near_letter,
+                )
+                return None
+        if strict:
+            self.log.warning(
+                "选项 %s 位置复核失败: 二次 OCR 未找到该字母行，拒绝按行距盲点", letter
+            )
+            return None
+        return planned
+
     def _option_rect_from_layout(
         self, dialog: Rect, letter: str, checkbox_x: int
     ) -> Optional[Rect]:
-        """图片选项 OCR 只认出 C/D 时，按已知行距推算 A/B 的圆点行。"""
+        """选项字母没被 OCR 读到、但有其它选项行时，按行距推算圆点位置。"""
         try:
             page = self.read(self.screen.grab(), dialog)
         except Exception:  # noqa: BLE001
@@ -823,19 +960,25 @@ class QuizHandler:
         if not rows:
             return None
         target = ord(letter.upper()) - 65
-        if len(rows) >= 2:
-            steps = [rows[i + 1][1] - rows[i][1] for i in range(len(rows) - 1)]
-            step = float(np.median([x for x in steps if x > 0])) if any(x > 0 for x in steps) else 0.0
+        lower = max((row for row in rows if row[0] < target), default=None)
+        upper = min((row for row in rows if row[0] > target), default=None)
+        if lower is not None and upper is not None:
+            # 目标夹在两行之间：直接按字母序号插值。不能用“中位行距”外推，
+            # 例如只认出 A/B/D 时 A->B=60、B->D=120，中位数 90 会把 C 算到 D。
+            y = lower[1] + (target - lower[0]) * (upper[1] - lower[1]) / (upper[0] - lower[0])
         else:
-            step = 0.0
-        if step <= 8:
-            step = max(30.0, 0.09 * dialog.height)
-        base_idx, base_y = rows[0]
-        y = int(round(base_y + (target - base_idx) * step))
+            units = [
+                (b[1] - a[1]) / (b[0] - a[0])
+                for a, b in zip(rows, rows[1:])
+                if b[0] > a[0] and b[1] > a[1]
+            ]
+            step = float(np.median(units)) if units else max(30.0, 0.09 * dialog.height)
+            base = lower or upper or rows[0]
+            y = base[1] + (target - base[0]) * step
         if not (dialog.y0 < y < dialog.y1):
             return None
-        h = max(12, int(step * 0.35))
-        return Rect(checkbox_x - h, y - h, checkbox_x + h, y + h)
+        h = max(12, int(0.045 * dialog.height))
+        return Rect(checkbox_x - h, int(round(y)) - h, checkbox_x + h, int(round(y)) + h)
 
     def _feedback_visible(self, dialog: Rect) -> bool:
         try:
@@ -874,13 +1017,20 @@ class QuizHandler:
         selected_rects: dict[str, Rect] = {}
         for letter in targets:
             rect = self._scroll_until_option(dialog, letter)
+            estimated = False
             if rect is None:
                 rect = self._option_rect_from_layout(dialog, letter, checkbox_x)
+                estimated = True
                 if rect is not None:
                     self.log.info("选项 %s 文字/图片未被 OCR 读到，按行距定位圆点", letter)
             if rect is None:
                 self.log.error("未能在弹窗中找到选项 %s", letter)
                 return False
+            verified = self._verify_option_row(dialog, letter, rect, strict=estimated)
+            if verified is None:
+                self.log.error("选项 %s 位置复核未通过，停止点击以免选到相邻选项", letter)
+                return False
+            rect = verified
             selected_rects[letter] = rect
             y = rect.cy
             frame = self.screen.grab()
@@ -889,11 +1039,14 @@ class QuizHandler:
                 self.mouse.click(checkbox_x, y, f"选择 {letter}")
                 time.sleep(0.4)
                 frame = self.screen.grab()
-                # 单选可能立即判分并导致选项行下移，重新定位后再兜底点击
-                current = self._option_rect_current(dialog, letter) or rect
-                if not self._selected(frame, current, checkbox_x):
-                    self.mouse.click(current.cx, current.cy, f"选择 {letter}(文字)")
-                    time.sleep(0.35)
+                # 单选可能立即判分并导致选项行下移，重新定位后再兜底点击；
+                # 这里必须用高倍字母列复核，不能再用整卡 OCR 的映射，
+                # 否则可能把已经选中的 C 又点到相邻的 D。
+                if not self._selected(frame, rect, checkbox_x):
+                    current = self._option_rows(frame, dialog).get(letter) or rect
+                    if not self._selected(frame, current, checkbox_x):
+                        self.mouse.click(current.cx, current.cy, f"选择 {letter}(文字)")
+                        time.sleep(0.35)
         # 平台判分可能比选项圆点变蓝晚 1 秒；先等一会儿，再看“正确/错误”徽标
         time.sleep(0.8)
         if self._feedback_visible(dialog):
@@ -902,9 +1055,14 @@ class QuizHandler:
         self.scroll_to_top(dialog)
         frame = self.screen.grab()
         page = self.read(frame, dialog)
+        rows = self._option_rows(frame, dialog)
         missing = []
         for letter in targets:
-            rect = page.option_rects.get(letter) or selected_rects.get(letter)
+            rect = (
+                rows.get(letter)
+                or page.option_rects.get(letter)
+                or selected_rects.get(letter)
+            )
             if rect is None:
                 rect = self._scroll_until_option(dialog, letter)
             if rect is None or not self._selected(self.screen.grab(), rect, checkbox_x):
@@ -1020,6 +1178,11 @@ class QuizHandler:
             raise FatalError(
                 "弹题识别失败",
                 "没有任何可见选项，无法作答或随机兜底，已停止以避免乱点",
+            )
+        if not any(v.strip() for v in question.options.values()):
+            self.log.info(
+                "选项为图片（只识别到 %s 标签），按视觉模式作答",
+                "/".join(sorted(question.options)),
             )
         if not question.text:
             self.log.warning("题干 OCR 为空，继续用选项/图像作答: %s", question.prompt_text())

@@ -91,6 +91,18 @@ class PanelScanner:
         lines = sort_lines(lines, row_tolerance=max(6, int(0.012 * layout.screen_w)))
         return self.parse(lines, frame, layout)
 
+    @staticmethod
+    def _is_system_tray_text(rect: Rect, layout: Layout) -> bool:
+        """OCR 行是否落在屏幕右下角的系统托盘（任务栏时钟/日期）。
+
+        目录裁剪区域的下边界就是屏幕底部，Windows 任务栏会一起进图；
+        托盘里的 ``15:35`` 能被 ``parse_duration`` 读成时长，必须排除。
+        """
+        panel = layout.panel
+        tray_top = layout.screen_h - max(48, int(0.045 * layout.screen_h))
+        tray_left = panel.x1 - max(100, int(0.30 * panel.width))
+        return rect.y0 >= tray_top and rect.x0 >= tray_left
+
     def parse(self, lines: list[OcrLine], frame: np.ndarray, layout: Layout) -> list[Lesson]:
         panel = layout.panel
         duration_lines: list[tuple[OcrLine, int]] = []
@@ -106,6 +118,12 @@ class PanelScanner:
         for duration_line, seconds in duration_lines:
             rect = duration_line.rect
             if rect.y0 < panel.y0 + 2 or rect.y1 > min(layout.screen_h, panel.y1) - 2:
+                continue
+            if self._is_system_tray_text(rect, layout):
+                # 目录面板一直裁到屏幕底部，会把 Windows 任务栏时钟（如 15:35）
+                # 读成“最后一个视频”的时长。视频时长在标题下方左对齐，
+                # 不会出现在屏幕右下角的系统托盘区域。
+                log.debug("忽略任务栏区域的时间文本: %r @ %s", duration_line.text, rect)
                 continue
             font_h = int(np.clip(rect.height, 10, 40))
             row_top = int(rect.y0 - float(self.cfg.panel.row_title_gap) * font_h)
@@ -127,7 +145,14 @@ class PanelScanner:
                 in_row = row_top <= cy <= rect.y0 + 0.7 * font_h
                 # 索引（1.1 / 2.3）
                 m_index = INDEX_RE.match(line.text)
-                if m_index and line.rect.x1 < rect.x0 - 0.4 * font_h and row_top - font_h <= cy <= rect.y1:
+                if (
+                    m_index
+                    and line.rect.x1 < rect.x0 - 0.4 * font_h
+                    and row_top - 0.5 * font_h <= cy <= rect.y1
+                    # 编号要和本行时长垂直相邻；否则只露出标题的半截视频
+                    # 会把上一行的编号抢过来，造成面包屑永恒不匹配。
+                    and abs(cy - rect.cy) <= 1.6 * font_h
+                ):
                     if abs(cy - rect.cy) < index_cy:
                         index = f"{int(m_index.group(1))}.{int(m_index.group(2))}"
                         index_cy = abs(cy - rect.cy)
@@ -224,13 +249,23 @@ class PanelNavigator:
 
     SIG_THRESHOLD = 40
 
-    def __init__(self, scanner: PanelScanner, ocr: OcrEngine, cfg: Config, mouse, screen, layout: Layout):
+    def __init__(
+        self,
+        scanner: PanelScanner,
+        ocr: OcrEngine,
+        cfg: Config,
+        mouse,
+        screen,
+        layout: Layout,
+        pause=None,
+    ):
         self.scanner = scanner
         self.ocr = ocr
         self.cfg = cfg
         self.mouse = mouse
         self.screen = screen
         self.layout = layout
+        self._pause = pause
         self._last_lessons: list[Lesson] = []
         self.last_scan_complete = False
         self._view_step = 0
@@ -359,6 +394,8 @@ class PanelNavigator:
         seen: dict[str, Lesson] = {}
         unchanged = 0
         for page in range(self._max_pages()):
+            if self._pause is not None:
+                self._pause()
             frame = self.screen.grab()
             lessons = self.scan(frame)
             for lesson in lessons:

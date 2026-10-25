@@ -222,8 +222,16 @@ class QuizQuestion:
         lines = [f"题型：{self.kind or '未知'}"] if self.kind else []
         lines.append(f"题目：{self.text}")
         lines.append("选项：")
+        image_option = False
         for k in self.letters:
-            lines.append(f"{k}. {self.options[k]}")
+            value = (self.options.get(k) or "").strip()
+            if value:
+                lines.append(f"{k}. {value}")
+            else:
+                image_option = True
+                lines.append(f"{k}. （图片选项，见弹窗截图）")
+        if image_option:
+            lines.append("说明：部分选项正文是图片，请结合截图按选项从上到下的 A/B/C/D 顺序判断。")
         return "\n".join(lines)
 
 

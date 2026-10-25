@@ -102,6 +102,10 @@ class AutoLesson:
         self.notify = notifier
         self.log = logger or log
         self.stop_event = stop_event or threading.Event()
+        # 暂停只冻结脚本推进：观看循环、选视频、弹题等都会在当前栈位置等待，
+        # 恢复后继续当前视频/当前目录位置，不会重新 scan_all/scroll_to_top。
+        self.pause_event = threading.Event()
+        self._pause_lock = threading.Lock()
         self.llm = LLMClient(cfg, state, self.log.getChild("llm")) if cfg.quiz.enabled else None
         self.quiz = (
             QuizHandler(
@@ -175,7 +179,8 @@ class AutoLesson:
         self.layout = self._calibrate(frame)
         self.scanner = PanelScanner(self.ocr, self.cfg)
         self.navigator = PanelNavigator(
-            self.scanner, self.ocr, self.cfg, self.mouse, self.screen, self.layout
+            self.scanner, self.ocr, self.cfg, self.mouse, self.screen, self.layout,
+            pause=self._check_pause,
         )
         # AI 助教弹窗会遮挡目录/状态图标，必须先收起再处理课程页
         self._prepare_ai_assistant()
@@ -187,7 +192,8 @@ class AutoLesson:
                 self.layout = Layout.detect(frame, lines, self.cfg)
                 self.scanner = PanelScanner(self.ocr, self.cfg)
                 self.navigator = PanelNavigator(
-                    self.scanner, self.ocr, self.cfg, self.mouse, self.screen, self.layout
+                    self.scanner, self.ocr, self.cfg, self.mouse, self.screen, self.layout,
+                    pause=self._check_pause,
                 )
         self._check_course_page(frame)
         if not self.layout.calibrated:
@@ -198,7 +204,8 @@ class AutoLesson:
                 self.layout = refreshed
                 self.scanner = PanelScanner(self.ocr, self.cfg)
                 self.navigator = PanelNavigator(
-                    self.scanner, self.ocr, self.cfg, self.mouse, self.screen, self.layout
+                    self.scanner, self.ocr, self.cfg, self.mouse, self.screen, self.layout,
+                    pause=self._check_pause,
                 )
                 self.log.info("页面加载完成后已重新标定目录面板")
         self._prepare_ai_assistant()
@@ -206,7 +213,8 @@ class AutoLesson:
             "AutoLesson 开始挂机",
             f"课程页面已就绪，屏幕 {self.layout.screen_w}x{self.layout.screen_h}，"
             "脚本将自动观看未完成视频。请勿移动鼠标或锁屏。\n"
-            f"按 {self.cfg.runtime.stop_hotkey} 可随时安全停止。",
+            f"按 {self.cfg.runtime.stop_hotkey} 可随时安全停止，"
+            f"按 {getattr(self.cfg.runtime, 'pause_hotkey', 'F8')} 可暂停/继续。",
             "info",
         )
 
@@ -427,6 +435,7 @@ class AutoLesson:
             self.log.getChild("practice"),
             self.stop_event,
             notifier=self.notify,
+            pause_event=self.pause_event,
         )
         try:
             result = page.run(close_tab=True)
@@ -1353,11 +1362,36 @@ class AutoLesson:
         while time.monotonic() < end:
             if self.stop_event.is_set():
                 raise UserAbort("收到停止信号")
+            self._check_pause()
             time.sleep(min(0.25, max(0.0, end - time.monotonic())))
+
+    def toggle_pause(self) -> bool:
+        """切换暂停/继续；热键线程和 GUI 都可调用。返回 True 表示已暂停。"""
+        with self._pause_lock:
+            if self.pause_event.is_set():
+                self.pause_event.clear()
+                self.log.info("继续运行（从暂停位置恢复）")
+                return False
+            self.pause_event.set()
+            self.log.warning(
+                "已暂停：脚本停在当前位置，按 %s 或点击“继续”恢复",
+                str(getattr(self.cfg.runtime, "pause_hotkey", "F8")),
+            )
+            return True
+
+    def _check_pause(self) -> None:
+        """暂停闸门：阻塞在当前调用点，恢复后原路继续。"""
+        if not self.pause_event.is_set():
+            return
+        while self.pause_event.is_set():
+            if self.stop_event.is_set():
+                raise UserAbort("收到停止信号")
+            time.sleep(0.15)
 
     def _check_stop(self) -> None:
         if self.stop_event.is_set():
             raise UserAbort("收到停止信号")
+        self._check_pause()
 
     def _check_caps(self) -> None:
         max_lessons = int(self.cfg.runtime.max_lessons)

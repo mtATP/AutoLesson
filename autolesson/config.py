@@ -137,6 +137,8 @@ DEFAULTS: dict[str, Any] = {
         "max_lesson_attempts": 2,
         # 全局停止热键（Windows 原生 RegisterHotKey）：F1~F12 / ESC / PAUSE
         "stop_hotkey": "F9",
+        # 全局暂停/继续热键；与停止热键或额外停止键冲突时会自动禁用暂停键
+        "pause_hotkey": "F8",
         # 额外停止键；ESC 用低级键盘钩子监听且不拦截浏览器按键
         "extra_stop_hotkeys": ["ESC"],
         "monitor": 1,

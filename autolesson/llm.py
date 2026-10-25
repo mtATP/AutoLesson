@@ -437,7 +437,10 @@ def report_llm_fallback(
         cv2.imwrite(path, crop)
     except Exception as exc:  # noqa: BLE001
         logger.debug("保存随机兜底截图失败: %s", exc)
-    options = " | ".join(f"{k}. {v[:40]}" for k, v in sorted(question.options.items()))
+    options = " | ".join(
+        f"{k}. {(v[:40] if v and v.strip() else '（图片选项）')}"
+        for k, v in sorted(question.options.items())
+    )
     message = (
         f"题目: {question.text[:200]}\n"
         f"选项: {options}\n"

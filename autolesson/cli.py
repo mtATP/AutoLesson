@@ -15,7 +15,7 @@ import numpy as np
 from . import __version__, vision
 from .config import ConfigError, load_config
 from .controller import AutoLesson
-from .hotkey import HotkeyListener
+from .hotkey import HotkeyListener, parse_hotkey
 from .layout import Layout
 from .llm import LLMClient
 from .mouse import InputUnavailable, Mouse
@@ -190,6 +190,35 @@ def _require_llm_for_mode(cfg, log) -> bool:
     return False
 
 
+def _make_pause_listener(cfg, stop_event, log, on_toggle):
+    """注册暂停/继续热键；与停止热键冲突或无法识别时返回 None。"""
+    pause_key = str(getattr(cfg.runtime, "pause_hotkey", "F8") or "").strip().upper()
+    if not pause_key:
+        return None
+    if parse_hotkey(pause_key) is None:
+        log.warning("无法识别暂停热键 %r，已禁用（支持 F1~F12/ESC/PAUSE）", pause_key)
+        return None
+    stop_key = str(getattr(cfg.runtime, "stop_hotkey", "") or "").strip().upper()
+    extras = [
+        str(k).strip().upper()
+        for k in (cfg.get("runtime.extra_stop_hotkeys", ["ESC"]) or [])
+    ]
+    if pause_key == stop_key or pause_key in extras:
+        log.warning("暂停热键 %s 与停止热键冲突，已禁用暂停", pause_key)
+        return None
+    listener = HotkeyListener(
+        pause_key,
+        stop_event,
+        log,
+        hotkey_id=0x4154,
+        on_press=lambda _key: on_toggle(),
+        once=False,
+        label="暂停",
+    )
+    listener.start()
+    return listener
+
+
 def cmd_run(args) -> int:
     cfg = load_config(args.config, _common_overrides(args))
     log = setup_logging(cfg, args.verbose)
@@ -250,9 +279,14 @@ def cmd_run(args) -> int:
         extra_keys=list(cfg.get("runtime.extra_stop_hotkeys", ["ESC"]) or []),
     )
     hotkey.start()
+    pause_listener = _make_pause_listener(
+        cfg, stop_event, log.getChild("hotkey"), controller.toggle_pause
+    )
     try:
         return controller.run()
     finally:
+        if pause_listener is not None:
+            pause_listener.stop()
         hotkey.stop()
         try:
             signal.signal(signal.SIGINT, previous_handler)
@@ -286,6 +320,7 @@ def cmd_practice(args) -> int:
         raise
 
     stop_event = threading.Event()
+    pause_event = threading.Event()
     previous_handler = signal.getsignal(signal.SIGINT)
 
     def on_sigint(_signum, _frame):
@@ -293,6 +328,18 @@ def cmd_practice(args) -> int:
             raise KeyboardInterrupt
         stop_event.set()
         log.warning("收到 Ctrl+C，正在安全停止练习（再按一次强制退出）...")
+
+    pause_key = str(getattr(cfg.runtime, "pause_hotkey", "F8") or "F8")
+
+    def toggle_pause() -> None:
+        if pause_event.is_set():
+            pause_event.clear()
+            log.info("继续运行（从暂停位置恢复）")
+        else:
+            pause_event.set()
+            log.warning(
+                "已暂停：脚本停在当前位置，按 %s 或点击“继续”恢复", pause_key
+            )
 
     try:
         signal.signal(signal.SIGINT, on_sigint)
@@ -306,12 +353,15 @@ def cmd_practice(args) -> int:
         extra_keys=list(cfg.get("runtime.extra_stop_hotkeys", ["ESC"]) or []),
     )
     hotkey.start()
+    pause_listener = _make_pause_listener(
+        cfg, stop_event, log.getChild("hotkey"), toggle_pause
+    )
     llm = LLMClient(cfg, state, log.getChild("llm"))
     try:
         if args.page:
             page = PracticePage(
                 ocr, cfg, mouse, screen, llm, state, log.getChild("practice"), stop_event,
-                notifier=notifier,
+                notifier=notifier, pause_event=pause_event,
             )
             result = page.run(close_tab=not args.keep_open)
             log.info("当前练习页处理结果: %s", result)
@@ -344,7 +394,7 @@ def cmd_practice(args) -> int:
         navigator = PanelNavigator(scanner, ocr, cfg, mouse, screen, layout)
         runner = PracticeRunner(
             ocr, cfg, mouse, screen, llm, state, navigator,
-            log.getChild("practice"), stop_event, notifier,
+            log.getChild("practice"), stop_event, notifier, pause_event=pause_event,
         )
         max_tests = int(args.max_tests if args.max_tests is not None else cfg.practice.max_tests)
         result = runner.run(max_tests=max_tests)
@@ -369,6 +419,8 @@ def cmd_practice(args) -> int:
         notifier.send("自动练习已停止", f"{exc.reason}\n{exc.detail}", "fatal", force=True)
         return 2
     finally:
+        if pause_listener is not None:
+            pause_listener.stop()
         hotkey.stop()
         state.save()
         try:
