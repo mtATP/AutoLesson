@@ -11,20 +11,20 @@ from typing import Optional
 
 import numpy as np
 
-from . import vision
-from .config import Config
+from autolesson import vision
+from autolesson.config import Config
 from .layout import Layout
-from .llm import LLMClient, LLMError
-from .mouse import InputUnavailable, Mouse
-from .notify import Notifier
-from .ocr import OcrEngine, OcrUnavailable
+from autolesson.llm import LLMClient, LLMError
+from autolesson.mouse import InputUnavailable, Mouse
+from autolesson.notify import Notifier
+from autolesson.ocr import OcrEngine, OcrUnavailable
 from .panel import PanelNavigator, PanelScanner
 from .practice import PracticeEntry, PracticePage, PracticeScanner
 from .player import PlayerMonitor, _fmt
 from .quiz import QuizHandler
-from .screen import Screen, ScreenUnavailable
-from .state import State
-from .types import (
+from autolesson.screen import Screen, ScreenUnavailable
+from autolesson.state import State
+from autolesson.types import (
     STATUS_NOT_STARTED,
     FatalError,
     Lesson,
@@ -338,12 +338,12 @@ class AutoLesson:
 
     @staticmethod
     def _lesson_order(lesson: Lesson) -> tuple:
-        """按章节号排序（2.2 在 5.8 前），避免扫描插入顺序导致跳着选。"""
+        """按章节号排序（2.2 在 5.8 前），三级编号 3.3.1 也能正确排序。"""
         text = (getattr(lesson, "index", "") or getattr(lesson, "title", "") or "").strip()
-        m = re.match(r"(\d+)\s*[.．]\s*(\d+)", text)
+        m = re.match(r"(\d+)\s*[.．]\s*(\d+)(?:\s*[.．]\s*(\d+))?", text)
         if m:
-            return (int(m.group(1)), int(m.group(2)), text)
-        return (999, 999, text)
+            return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0), text)
+        return (999, 999, 0, text)
 
     # ================================================================== 布局/检查
     def _calibrate(self, frame: np.ndarray) -> Layout:
@@ -395,10 +395,13 @@ class AutoLesson:
     # ================================================================== 状态缓存/重试
     def _remember_completed(self, lesson: Lesson) -> None:
         self._known_completed.add(lesson.key)
-        self._known_completed.add(lesson.title_key)
+        if lesson.index:
+            self._known_completed.add(f"i:{lesson.index}")
 
     def _is_known_completed(self, lesson: Lesson) -> bool:
-        return lesson.key in self._known_completed or lesson.title_key in self._known_completed
+        if lesson.key in self._known_completed:
+            return True
+        return bool(lesson.index) and f"i:{lesson.index}" in self._known_completed
 
     def _is_pending(self, lesson: Lesson) -> bool:
         if lesson.completed:
@@ -532,23 +535,35 @@ class AutoLesson:
         self.state.note_watch(time.monotonic() - started)
         self.log.info("完成: %s | %s", lesson, self.state.summary())
 
+    def _find_in_frame(self, frame: np.ndarray, lesson: Lesson) -> Optional[Lesson]:
+        """先按常规分辨率找；6.1 这类时长行会因当前行/悬浮提示而漏 OCR。
+
+        同一帧再按 2 倍放大复扫一次，能读出灰色小字时长，避免整行被丢弃。
+        """
+        found = PanelNavigator.find(self.navigator.scan(frame), lesson)
+        if found is not None:
+            return found
+        self.log.info("常规 OCR 未找到 %s，尝试 2 倍复扫", lesson.index)
+        found = PanelNavigator.find(
+            self.navigator.scan(frame, upscale=2.0), lesson
+        )
+        return found
+
     def _click_lesson(self, lesson: Lesson) -> bool:
         """点击目标视频；若点击前发现平台已标记完成，返回 False。"""
+        if not lesson.index:
+            raise LessonError(f"拒绝点击缺少编号的目录项: {lesson.title}")
         for attempt in range(3):
             self._check_stop()
             frame = self._grab("点击视频前")
             if self._handle_overlays(frame):
                 frame = self._grab("关闭弹窗后")
-            current = self.navigator.scan(frame)
-            target = PanelNavigator.find(current, lesson)
+            target = self._find_in_frame(frame, lesson)
             if target is None:
                 self.log.warning("目标视频不在当前视图，重新滚动查找")
                 target = self._find_lesson_anywhere(lesson)
                 if target is None:
                     raise LessonError(f"目录中找不到视频: {lesson.title}")
-                frame = self._grab("定位视频后")
-                current = self.navigator.scan(frame)
-                target = PanelNavigator.find(current, lesson) or target
             if target.completed:
                 self.log.info("点击前发现平台已标记完成，跳过: %s", target)
                 self._remember_completed(target)
@@ -586,11 +601,13 @@ class AutoLesson:
                 if state.total and lesson.duration:
                     diff = abs(state.total - lesson.duration)
                     if diff > float(self.cfg.player.expected_total_tolerance):
-                        self.log.warning(
-                            "视频总时长 %s 与目录预计 %s 相差 %ds，可能进入的不是目标视频",
-                            _fmt(state.total),
-                            _fmt(lesson.duration),
-                            diff,
+                        # 目录项和实际播放器不是同一个视频（典型：章标题被
+                        # 当成视频、点到页底）。此时继续播放会看错视频，
+                        # 必须让重试逻辑重新点同一条，而不是将错就错。
+                        raise LessonError(
+                            f"视频总时长 {_fmt(state.total)} 与目录预计 "
+                            f"{_fmt(lesson.duration)} 相差 {diff}s，判断不是目标视频，"
+                            "中止本次处理并重新定位目录项"
                         )
                 self.log.info("播放器已加载: %s", state.raw_time)
                 return
@@ -923,8 +940,7 @@ class AutoLesson:
             frame = self._grab("校验完成")
             if self._handle_overlays(frame):
                 continue
-            current = self.navigator.scan(frame)
-            found = PanelNavigator.find(current, lesson)
+            found = self._find_in_frame(frame, lesson)
             if found is not None and found.completed:
                 self.log.info("平台已标记完成: %s", found)
                 self._remember_completed(found)
@@ -935,8 +951,7 @@ class AutoLesson:
             self.navigator.scroll_to_top()
             for _ in range(int(self.cfg.panel.max_scrolls)):
                 frame = self._grab("查找视频")
-                current = self.navigator.scan(frame)
-                found = PanelNavigator.find(current, lesson)
+                found = self._find_in_frame(frame, lesson)
                 if found is not None:
                     if found.completed:
                         self._remember_completed(found)
@@ -952,8 +967,7 @@ class AutoLesson:
         for _ in range(int(self.cfg.panel.max_scrolls)):
             self._check_stop()
             frame = self._grab("查找视频")
-            current = self.navigator.scan(frame)
-            found = PanelNavigator.find(current, lesson)
+            found = self._find_in_frame(frame, lesson)
             if found is not None:
                 return found
             if not self.navigator.scroll_down():
@@ -1299,7 +1313,7 @@ class AutoLesson:
         if not compact:
             return True
         if lesson.index:
-            indexes = re.findall(r"\d{1,2}\.\d{1,2}", compact)
+            indexes = re.findall(r"\d{1,2}(?:\.\d{1,2})+", compact)
             if indexes:
                 return lesson.index in indexes
         title = normalize_title(lesson.title)

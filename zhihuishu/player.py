@@ -7,11 +7,11 @@ from typing import Optional
 
 import numpy as np
 
-from . import vision
-from .config import Config
+from autolesson import vision
+from autolesson.config import Config
 from .layout import Layout
-from .ocr import OcrEngine
-from .types import PlaybackState, Rect
+from autolesson.ocr import OcrEngine
+from autolesson.types import PlaybackState, Rect
 
 log = logging.getLogger("autolesson.player")
 

@@ -215,7 +215,10 @@ class QuizQuestion:
     def hash_text(self) -> str:
         import hashlib
 
-        payload = self.text + "\n" + "\n".join(f"{k}.{self.options[k]}" for k in self.letters)
+        payload = (
+            f"kind={self.kind}\n" + self.text + "\n"
+            + "\n".join(f"{k}.{self.options[k]}" for k in self.letters)
+        )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
     def prompt_text(self) -> str:

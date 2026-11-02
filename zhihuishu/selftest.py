@@ -8,16 +8,16 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
-from . import vision
-from .config import load_config
+from autolesson import vision
+from autolesson.config import load_config
 from .controller import AutoLesson
 from .layout import Layout
-from .llm import LLMClient
-from .ocr import OcrEngine
+from autolesson.llm import LLMClient
+from autolesson.ocr import OcrEngine
 from .panel import PanelScanner, parse_duration
 from .player import PlayerMonitor, parse_clock, parse_time_range
 from .quiz import parse_feedback, parse_quiz
-from .types import STATUS_COMPLETED, STATUS_IN_PROGRESS, STATUS_NOT_STARTED, Rect
+from autolesson.types import STATUS_COMPLETED, STATUS_IN_PROGRESS, STATUS_NOT_STARTED, Rect
 
 log = logging.getLogger("autolesson.selftest")
 
@@ -344,7 +344,7 @@ def _expect(condition: bool, message: str) -> None:
 
 
 def _dummy_question():
-    from .types import QuizQuestion
+    from autolesson.types import QuizQuestion
 
     return QuizQuestion(
         kind="多选题",

@@ -27,6 +27,10 @@ DEFAULTS: dict[str, Any] = {
     },
     "panel": {
         "scroll_step": -5,
+        # 0 = 使用旧 scroll_step × 90；>0 直接指定每页像素，优先于比例
+        "scroll_step_px": 0,
+        # >0 时按目录可视高度比例滚动，适配不同分辨率/DPI；0 = 关闭
+        "scroll_step_ratio": 0.0,
         "scroll_wait": 0.8,
         "max_scrolls": 40,
         "top_scroll_clicks": 18,
@@ -34,6 +38,16 @@ DEFAULTS: dict[str, Any] = {
         "min_title_chars": 2,
         "ocr_upscale": 0.0,
         "right_icon_width": 62,
+    },
+    "fanya": {
+        # 泛雅右侧目录每页滚动量：px > 0 优先，否则按可视高度比例
+        "scroll_step_px": 0,
+        "scroll_step_ratio": 0.55,
+        "controls_wiggle": True,
+        "progress_timeout_seconds": 15.0,
+        "max_recoveries": 4,
+        "controls_wiggle_interval_seconds": 10.0,
+        "practice_max_views": 400,
     },
     "ocr": {
         # 限制 ONNX Runtime 线程，避免单次 OCR 占满所有 CPU 核心
@@ -267,8 +281,16 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
-def load_config(path: Optional[str | Path] = None, overrides: Optional[dict[str, Any]] = None) -> Config:
-    """加载并合并默认配置。相对路径的运行时文件以配置文件所在目录为基准。"""
+def load_config(
+    path: Optional[str | Path] = None,
+    overrides: Optional[dict[str, Any]] = None,
+    platform: Optional[str] = None,
+) -> Config:
+    """加载并合并默认配置。相对路径的运行时文件以配置文件所在目录为基准。
+
+    平台覆盖文件与主配置同目录：config.zhihuishu.yaml / config.fanya.yaml。
+    覆盖在命令行 overrides 之前合并，命令行参数仍优先。
+    """
 
     source_path: Optional[Path] = None
     data = copy.deepcopy(DEFAULTS)
@@ -278,6 +300,10 @@ def load_config(path: Optional[str | Path] = None, overrides: Optional[dict[str,
             data = _deep_merge(data, _load_yaml(source_path))
         elif str(path) not in ("config.yaml", "./config.yaml"):
             raise ConfigError(f"配置文件不存在: {source_path}")
+    if source_path is not None and platform:
+        profile = source_path.with_name(f"{source_path.stem}.{platform}.yaml")
+        if profile.exists():
+            data = _deep_merge(data, _load_yaml(profile))
     if overrides:
         data = _deep_merge(data, overrides)
     data = _expand_tree(data)

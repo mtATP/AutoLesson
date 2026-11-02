@@ -1,7 +1,7 @@
 """AutoLesson 图形控制台。
 
 只使用 Python 标准库 tkinter，不额外安装 GUI 依赖。
-真正运行时以子进程调用 `python -m autolesson <mode>`，因此：
+真正运行时以子进程调用 `python -m zhihuishu/fanya <mode>`，因此：
 - OCR/鼠标/截图崩溃不会带崩 GUI；
 - 日志可以实时显示；
 - 停止按钮通过模拟 F9 让子进程安全停止，超时再强制结束。
@@ -33,6 +33,12 @@ MODES = {
     "auto": ("列表模式", "按目录顺序完成视频和平时测试"),
     "practice": ("测试模式", "只处理平时测试，只暂存不提交"),
 }
+FANYA_MODES = {
+    "run": ("视频模式", "泛雅：只观看未完成视频，自动处理视频弹题"),
+    "practice": ("练习模式", "泛雅：只暂时保存练习，绝不提交"),
+    "auto": ("列表模式", "泛雅：按目录顺序处理视频和练习"),
+    "scan": ("目录扫描", "泛雅：只读扫描目录和任务点，不点击"),
+}
 
 SECTION_TITLES = {
     "window": "窗口",
@@ -47,7 +53,22 @@ SECTION_TITLES = {
     "notify": "通知",
     "runtime": "运行",
     "safety": "安全",
+    "fanya": "泛雅",
 }
+
+
+def _deep_diff(base: dict, current: dict) -> dict:
+    """只保留相对通用配置发生变化的键，平台文件保持“部分覆盖”。"""
+    out: dict = {}
+    for key, value in (current or {}).items():
+        old = (base or {}).get(key)
+        if isinstance(value, dict) and isinstance(old, dict):
+            sub = _deep_diff(old, value)
+            if sub:
+                out[key] = sub
+        elif value != old:
+            out[key] = copy.deepcopy(value)
+    return out
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -93,6 +114,7 @@ class App(tk.Tk):
         self.config_path = Path(config_path)
         if not self.config_path.is_absolute():
             self.config_path = self.project_root / self.config_path
+        self._platform_key = "zhihuishu"
         self.data = self._load_raw()
         self.vars: dict[str, tuple[str, tk.Variable]] = {}
         self.proc: Optional[subprocess.Popen] = None
@@ -100,6 +122,8 @@ class App(tk.Tk):
         self._stop_sent = False
         self._paused = False
         self._run_mode = ""
+        self._run_platform = "zhihuishu"
+        self._platform_key = "zhihuishu"
         self._bar: Optional[tk.Toplevel] = None
         self._bar_status: Optional[tk.Label] = None
         self._bar_log: Optional[tk.Label] = None
@@ -115,6 +139,11 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------ 配置
+    def _profile_path(self) -> Path:
+        return self.config_path.with_name(
+            f"{self.config_path.stem}.{self._platform_key}.yaml"
+        )
+
     def _load_raw(self) -> dict:
         data = copy.deepcopy(DEFAULTS)
         if self.config_path.exists():
@@ -124,6 +153,14 @@ class App(tk.Tk):
                     data = _deep_merge(data, raw)
             except Exception as exc:  # noqa: BLE001
                 messagebox.showwarning("读取配置失败", f"{self.config_path}\n{exc}")
+        profile = self._profile_path()
+        if profile.exists():
+            try:
+                raw = yaml.safe_load(profile.read_text(encoding="utf-8")) or {}
+                if isinstance(raw, dict):
+                    data = _deep_merge(data, raw)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showwarning("读取平台配置失败", f"{profile}\n{exc}")
         return data
 
     def _build_style(self) -> None:
@@ -146,6 +183,19 @@ class App(tk.Tk):
             text="纯视觉网课助手",
             style="Hint.TLabel",
         ).pack(side="left", padx=(10, 24))
+
+        self.platform_var = tk.StringVar(
+            value="泛雅" if self._platform_key == "fanya" else "智慧树"
+        )
+        self.platform_box = ttk.Combobox(
+            top,
+            values=["智慧树", "泛雅"],
+            textvariable=self.platform_var,
+            state="readonly",
+            width=9,
+        )
+        self.platform_box.pack(side="left", padx=(0, 8))
+        self.platform_box.bind("<<ComboboxSelected>>", self._switch_platform)
 
         self.mode_var = tk.StringVar(value="run")
         self.mode_box = ttk.Combobox(
@@ -197,8 +247,30 @@ class App(tk.Tk):
         names = [str(llm.get("api_key_env") or "").strip(), "LLM_API_KEY", "OPENAI_API_KEY"]
         return any(name and os.environ.get(name, "").strip() for name in names)
 
+    def _selected_platform(self) -> str:
+        return "fanya" if self.platform_var.get() == "泛雅" else "zhihuishu"
+
+    def _modes(self) -> dict:
+        return FANYA_MODES if self._selected_platform() == "fanya" else MODES
+
+    def _switch_platform(self, _event=None) -> None:
+        if self.proc is not None:
+            messagebox.showwarning("正在运行", "请先停止当前任务再切换版本。")
+            self.platform_var.set("智慧树" if self._run_platform == "zhihuishu" else "泛雅")
+            return
+        self._platform_key = (
+            "fanya" if self.platform_var.get() == "泛雅" else "zhihuishu"
+        )
+        self._refresh_modes()
+        self._set_paused_ui(False)
+        # 重新载入当前平台的覆盖配置，设置页随之切换
+        self.after(10, self.reload_config)
+
     def _refresh_modes(self) -> None:
-        available = ["run"] if not self._llm_ready() else ["run", "auto", "practice"]
+        if self._selected_platform() == "fanya":
+            available = ["run", "practice", "auto", "scan"]
+        else:
+            available = ["run"] if not self._llm_ready() else ["run", "auto", "practice"]
         self.mode_box.configure(values=[self._mode_label(k) for k in available])
         current = self._selected_mode()
         if current not in available:
@@ -206,15 +278,18 @@ class App(tk.Tk):
         self._update_mode_hint()
 
     def _mode_label(self, key: str) -> str:
-        return f"{key}  {MODES[key][0]}"
+        modes = self._modes()
+        if key not in modes:
+            key = "run"
+        return f"{key}  {modes[key][0]}"
 
     def _selected_mode(self) -> str:
         return self.mode_box.get().split()[0]
 
     def _update_mode_hint(self) -> None:
         key = self._selected_mode()
-        text = MODES[key][1]
-        if not self._llm_ready():
+        text = self._modes().get(key, ("", ""))[1]
+        if self._selected_platform() != "fanya" and not self._llm_ready():
             text = "无 LLM：只允许视频模式，弹题随机选择；列表/测试模式已禁用"
         self.mode_hint.configure(text=text)
 
@@ -232,8 +307,11 @@ class App(tk.Tk):
                 self._add_field(page.inner, section, key, value)
         bottom = ttk.Frame(self, padding=(12, 4))
         bottom.pack(fill="x")
-        ttk.Button(bottom, text="保存到 config.yaml", command=self.save_config).pack(
+        ttk.Button(bottom, text="保存到通用 config.yaml", command=self.save_config).pack(
             side="left"
+        )
+        ttk.Button(bottom, text="保存为当前平台专用", command=self.save_profile).pack(
+            side="left", padx=8
         )
         ttk.Button(bottom, text="重新载入", command=self.reload_config).pack(
             side="left", padx=8
@@ -292,6 +370,42 @@ class App(tk.Tk):
             data.setdefault(section, {})[key] = value
         return data
 
+    def save_profile(self) -> None:
+        try:
+            data = self._collect_config()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("配置格式错误", str(exc))
+            return
+        profile = self._profile_path()
+        if not messagebox.askyesno(
+            "保存平台专用配置",
+            f"将把当前设置保存为\n{profile.name}\n"
+            "只影响当前平台，切换另一平台时不会使用这些值。继续？",
+        ):
+            return
+        try:
+            common = copy.deepcopy(DEFAULTS)
+            if self.config_path.exists():
+                raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+                if isinstance(raw, dict):
+                    common = _deep_merge(common, raw)
+            changes = _deep_diff(common, data)
+            if not changes:
+                messagebox.showinfo("无需保存", "当前设置与通用 config.yaml 相同，没有平台专用差异。")
+                return
+            if profile.exists():
+                backup = profile.with_suffix(profile.suffix + ".bak")
+                backup.write_bytes(profile.read_bytes())
+            profile.write_text(
+                yaml.safe_dump(changes, allow_unicode=True, sort_keys=False, default_flow_style=False),
+                encoding="utf-8",
+            )
+            self.data = data
+            self._refresh_modes()
+            messagebox.showinfo("已保存", f"平台专用差异已写入\n{profile}")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("保存失败", str(exc))
+
     def save_config(self) -> None:
         try:
             data = self._collect_config()
@@ -300,7 +414,7 @@ class App(tk.Tk):
             return
         if not messagebox.askyesno(
             "保存配置",
-            "将重写 config.yaml（原有注释会丢失，但会先生成 config.yaml.bak）。继续？",
+            "将重写通用 config.yaml（原有注释会丢失，但会先生成 .bak）。继续？",
         ):
             return
         try:
@@ -388,16 +502,23 @@ class App(tk.Tk):
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("配置错误", str(exc))
             return
+        platform = self._selected_platform()
         mode = self._selected_mode()
-        if mode != "run" and not self._llm_ready():
+        if (
+            (platform != "fanya" and mode != "run")
+            or (platform == "fanya" and mode in ("practice", "auto"))
+        ) and not self._llm_ready():
             messagebox.showwarning(
                 "无 LLM 模式",
                 "未配置 API Key 或 llm.enabled=false：只允许视频模式。\n"
                 "列表模式和测试模式已禁用。",
             )
             return
-        cmd = [sys.executable, "-m", "autolesson", mode, "--config", str(config)]
-        if self.clear_var.get():
+        module = "zhihuishu" if platform == "zhihuishu" else "fanya"
+        cmd = [sys.executable, "-m", module, mode, "--config", str(config)]
+        if platform == "fanya" and mode == "scan":
+            cmd.append("--all")
+        if platform == "zhihuishu" and self.clear_var.get():
             cmd.append("--clear-record")
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
@@ -423,12 +544,13 @@ class App(tk.Tk):
             return
         self._stop_sent = False
         self._run_mode = mode
+        self._run_platform = platform
         self._paused = False
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self._set_paused_ui(False)
-        self.status_var.set(f"运行中：{MODES[mode][0]}")
-        self._set_bar_status(f"运行中：{MODES[mode][0]}")
+        self.status_var.set(f"运行中：{self._run_label()}")
+        self._set_bar_status(f"运行中：{self._run_label()}")
         self._cancel_bar_autohide()
         self._append_log(f"$ {' '.join(cmd)}\n")
         threading.Thread(target=self._read_output, daemon=True).start()
@@ -467,8 +589,9 @@ class App(tk.Tk):
             self._bar_pause_btn.configure(state="disabled", text="暂停")
         self.status_var.set(f"已结束（退出码 {code}）")
         self._set_bar_status(f"已结束（{code}）")
-        # 任务结束后小条自动收起，避免一直挡在屏幕顶部；10 秒内重新开始会取消。
-        if self._bar is not None:
+        # 正常结束仍自动收起，避免一直挡在屏幕顶部；用户主动按“停止”后
+        # 小条保持打开，方便查看结束状态或直接重新开始。
+        if self._bar is not None and not self._stop_sent:
             self._schedule_bar_autohide(10000)
 
     def _pause_hotkey(self) -> str:
@@ -476,6 +599,8 @@ class App(tk.Tk):
         return str(runtime.get("pause_hotkey", "F8") or "F8").strip().upper()
 
     def _pause_available(self) -> bool:
+        if self._selected_platform() == "fanya":
+            return False
         runtime = self.data.get("runtime", {}) if isinstance(self.data, dict) else {}
         key = self._pause_hotkey()
         if parse_hotkey(key) is None:
@@ -512,6 +637,10 @@ class App(tk.Tk):
             self._bar_pause_btn.configure(state="disabled")
         self.after(1200, lambda: self._set_paused_ui(self._paused))
 
+    def _run_label(self) -> str:
+        modes = FANYA_MODES if self._run_platform == "fanya" else MODES
+        return modes.get(self._run_mode, ("运行中", ""))[0]
+
     def _set_paused_ui(self, paused: bool) -> None:
         self._paused = bool(paused)
         key = self._pause_hotkey()
@@ -532,7 +661,7 @@ class App(tk.Tk):
                 self.status_var.set(f"已暂停（{key} 继续）")
                 self._set_bar_status(f"已暂停（{key} 继续）")
             elif self._run_mode:
-                label = MODES.get(self._run_mode, ("运行中", ""))[0]
+                label = self._run_label()
                 self.status_var.set(f"运行中：{label}")
                 self._set_bar_status(f"运行中：{label}")
 

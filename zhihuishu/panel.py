@@ -7,11 +7,11 @@ from typing import Optional
 
 import numpy as np
 
-from . import vision
-from .config import Config
+from autolesson import vision
+from autolesson.config import Config
 from .layout import Layout
-from .ocr import OcrEngine, sort_lines
-from .types import (
+from autolesson.ocr import OcrEngine, sort_lines
+from autolesson.types import (
     STATUS_COMPLETED,
     STATUS_IN_PROGRESS,
     STATUS_NOT_STARTED,
@@ -29,7 +29,7 @@ DURATION_RE = re.compile(r"(?:(\d{1,3})\s*:\s*)?(\d{1,2})\s*:\s*(\d{2})")
 CLOCK_NOISE_RE = re.compile(
     r"^[●•·\s]*(?:\d{1,3}\s*[:：]\s*)?\d{1,2}\s*[:：]\s*\d{1,2}\s*$"
 )
-INDEX_RE = re.compile(r"^\s*(\d{1,2})\s*[.．]\s*(\d{1,2})\s*$")
+INDEX_RE = re.compile(r"^\s*(\d{1,2}(?:\s*[.．]\s*\d{1,2}){1,3})\s*$")
 PERCENT_RE = re.compile(r"(\d{1,3})\s*%")
 PERCENT_REV_RE = re.compile(r"%\s*(\d{1,3})\s*%")
 CHAPTER_RE = re.compile(r"第\s*[一二三四五六七八九十百零〇\d]+\s*章")
@@ -79,12 +79,15 @@ class PanelScanner:
         self.cfg = cfg
 
     # ------------------------------------------------------------------ 扫描
-    def scan(self, frame: np.ndarray, layout: Layout) -> list[Lesson]:
+    def scan(
+        self, frame: np.ndarray, layout: Layout, upscale: Optional[float] = None
+    ) -> list[Lesson]:
         panel = layout.panel
         if panel.width < 80 or panel.height < 80:
             return []
         crop = panel.crop(frame)
-        upscale = float(self.cfg.panel.ocr_upscale or 0)
+        if upscale is None:
+            upscale = float(self.cfg.panel.ocr_upscale or 0)
         if upscale <= 0:
             upscale = 1.0
         lines = self.ocr.read(crop, offset=(panel.x0, panel.y0), upscale=upscale)
@@ -119,7 +122,9 @@ class PanelScanner:
             rect = duration_line.rect
             if rect.y0 < panel.y0 + 2 or rect.y1 > min(layout.screen_h, panel.y1) - 2:
                 continue
-            if self._is_system_tray_text(rect, layout):
+            if self._is_system_tray_text(rect, layout) or (
+                rect.cy > layout.screen_h - max(48, int(0.045 * layout.screen_h))
+            ):
                 # 目录面板一直裁到屏幕底部，会把 Windows 任务栏时钟（如 15:35）
                 # 读成“最后一个视频”的时长。视频时长在标题下方左对齐，
                 # 不会出现在屏幕右下角的系统托盘区域。
@@ -135,6 +140,7 @@ class PanelScanner:
             title_parts: list[OcrLine] = []
             index: Optional[str] = None
             index_cy = 10**9
+            index_line_cy: Optional[int] = None
             percent: Optional[int] = None
             for line in lines:
                 if line is duration_line:
@@ -154,8 +160,10 @@ class PanelScanner:
                     and abs(cy - rect.cy) <= 1.6 * font_h
                 ):
                     if abs(cy - rect.cy) < index_cy:
-                        index = f"{int(m_index.group(1))}.{int(m_index.group(2))}"
+                        raw_index = re.sub(r"\s+", "", m_index.group(1)).replace("．", ".")
+                        index = raw_index
                         index_cy = abs(cy - rect.cy)
+                        index_line_cy = cy
                     continue
                 if not in_row:
                     continue
@@ -189,14 +197,44 @@ class PanelScanner:
 
             if not title_parts:
                 continue
+            if index_line_cy is not None:
+                # 标题必须和本行编号垂直对齐。章标题（如“函数”）在编号上方
+                # 较远，页边界处会被错配成下一条视频的时长，必须排除。
+                aligned = [
+                    ln for ln in title_parts if abs(ln.cy - index_line_cy) <= 1.7 * font_h
+                ]
+                if not aligned:
+                    continue
+                title_parts = aligned
             title_parts.sort(key=lambda ln: ln.cx)
             title = _join_title([ln.text for ln in title_parts])
-            title = re.sub(r"^[A-Za-z0-9]+\s*[.、．]\s*", "", title) if not index else title
+            if not index:
+                # OCR 有时把编号和标题合成一行，例如
+                # “3.3.1 数据与数据类型（上）”；不能把编号当标题前缀删掉。
+                m_lead = re.match(
+                    r"^\s*(\d{1,2}(?:\s*[.．]\s*\d{1,2}){1,3})\s*[、.．]?\s*(.+)$",
+                    title,
+                )
+                if m_lead:
+                    index = re.sub(r"\s+", "", m_lead.group(1)).replace("．", ".")
+                    title = m_lead.group(2).strip()
+            # 没读到编号的半行只能等下一次重叠滚动后重新识别，不能参与
+            # 待学队列。否则任务栏时钟会和页尾任意标题拼出假视频。
+            if not index:
+                log.debug("忽略缺少编号的目录残片: %r", title)
+                continue
             if len(normalize_title(title)) < int(self.cfg.panel.min_title_chars):
                 continue
             if any(word in title for word in TEST_WORDS):
                 continue
             if DURATION_RE.fullmatch(title.strip()) or CLOCK_NOISE_RE.fullmatch(title.strip()):
+                continue
+            # 时长和标题位于同一文字列。跨列的托盘时钟即使靠近编号
+            # 也不能用来组成视频；检查区间重叠而非固定屏幕坐标。
+            if not any(
+                part.rect.x0 - font_h <= rect.x0 <= part.rect.x1 + font_h
+                for part in title_parts
+            ):
                 continue
             title_rect = title_parts[0].rect
             for part in title_parts[1:]:
@@ -278,10 +316,23 @@ class PanelNavigator:
     def _scroll_step(self) -> int:
         """一页滚动的目标像素数。
 
-        默认 scroll_step=-5 -> 450px（约 9 行），相邻页仍保留一半以上重叠；
-        需要更快可调到 -8/-10，最大 600px。
+        优先级：scroll_step_px > scroll_step_ratio > 旧版 scroll_step × 90。
+        比例基于目录可视高度，换分辨率/DPI 后不用重调像素值。
         """
-        return min(600, max(300, abs(int(self.cfg.panel.scroll_step)) * 90))
+        panel_cfg = self.cfg.panel
+        px = int(getattr(panel_cfg, "scroll_step_px", 0) or 0)
+        if px:
+            step = min(2000, max(60, abs(px)))
+            log.debug("目录滚动步长: %dpx（scroll_step_px）", step)
+            return step
+        ratio = float(getattr(panel_cfg, "scroll_step_ratio", 0) or 0)
+        if ratio:
+            step = min(2000, max(60, int(self.layout.panel.height * abs(ratio))))
+            log.debug("目录滚动步长: %dpx（scroll_step_ratio=%.2f）", step, abs(ratio))
+            return step
+        step = min(600, max(300, abs(int(panel_cfg.scroll_step)) * 90))
+        log.debug("目录滚动步长: %dpx（旧版 scroll_step）", step)
+        return step
 
     def _scroll_wait(self) -> float:
         return min(0.35, float(self.cfg.panel.scroll_wait))
@@ -303,9 +354,14 @@ class PanelNavigator:
     def _max_pages(self) -> int:
         return max(12, min(40, int(self.cfg.panel.max_scrolls)))
 
-    def scan(self, frame: Optional[np.ndarray] = None) -> list[Lesson]:
+    def scan(
+        self, frame: Optional[np.ndarray] = None, upscale: Optional[float] = None
+    ) -> list[Lesson]:
         frame = self.screen.grab() if frame is None else frame
-        self._last_lessons = self.scanner.scan(frame, self.layout)
+        if upscale is None:
+            self._last_lessons = self.scanner.scan(frame, self.layout)
+        else:
+            self._last_lessons = self.scanner.scan(frame, self.layout, upscale=upscale)
         return self._last_lessons
 
     def _signature_of(self, img: np.ndarray) -> bytes:
@@ -380,30 +436,46 @@ class PanelNavigator:
                 sig = new_sig
         log.debug("目录已回到顶部")
 
-    def scroll_down(self) -> bool:
+    def scroll_down(self, step: Optional[int] = None) -> bool:
         """滚动约半屏，只比较图像指纹；OCR 留给 scan_all 每页做一次。"""
         before = self._current_signature()
-        self._wheel_scroll(self._scroll_step(), -1)
+        self._wheel_scroll(step or self._scroll_step(), -1)
         time.sleep(0.35)
         after = self._wait_settle(before)
         return vision.signature_distance(before, after) > self.SIG_THRESHOLD
 
+    @staticmethod
+    def _merge_lesson(seen: dict[str, Lesson], lesson: Lesson) -> None:
+        # 同一视频在不同页可能被 OCR 截断成不同标题；按编号合并，
+        # 否则 76 个视频会混进重复项，真正的 5.1/6.1 反而被挤掉。
+        key = lesson.index or lesson.key
+        existing = seen.get(key)
+        if existing is None:
+            seen[key] = lesson
+            return
+        if lesson.completed and not existing.completed:
+            seen[key] = lesson
+            return
+        if existing.completed and not lesson.completed:
+            return
+        if len(normalize_title(lesson.title)) > len(normalize_title(existing.title)):
+            seen[key] = lesson
+
     def scan_all(self) -> list[Lesson]:
-        self.scroll_to_top()
-        self.last_scan_complete = False
         seen: dict[str, Lesson] = {}
+        self.last_scan_complete = False
+        self.scroll_to_top()
         unchanged = 0
         for page in range(self._max_pages()):
             if self._pause is not None:
                 self._pause()
-            frame = self.screen.grab()
-            lessons = self.scan(frame)
+            lessons = self.scan(self.screen.grab())
             for lesson in lessons:
-                existing = seen.get(lesson.key)
-                if existing is None or (lesson.completed and not existing.completed):
-                    seen[lesson.key] = lesson
-            if page > 0 and not lessons and not seen:
-                time.sleep(1.0)
+                if lesson.index:
+                    self._merge_lesson(seen, lesson)
+            log.info("目录扫描第 %d 页: 累计 %d 个视频", page + 1, len(seen))
+            if page > 0 and not lessons:
+                time.sleep(0.8)
             if not self.scroll_down():
                 unchanged += 1
                 if unchanged >= 2:
@@ -411,30 +483,23 @@ class PanelNavigator:
                     break
             else:
                 unchanged = 0
-            log.info("目录扫描第 %d 页: 累计 %d 个视频", page + 1, len(seen))
         if self.last_scan_complete:
             log.info("目录全量扫描完成: %d 个视频", len(seen))
         else:
-            log.error(
-                "目录扫描达到 %d 页上限仍未到底，只读到 %d 个视频",
-                self._max_pages(),
-                len(seen),
-            )
+            log.error("目录达到 %d 页上限仍未到底，累计 %d 个视频",
+                      self._max_pages(), len(seen))
         self.scroll_to_top()
         return list(seen.values())
 
     @staticmethod
     def find(lessons: list[Lesson], target: Lesson) -> Optional[Lesson]:
-        for lesson in lessons:
-            if lesson.key == target.key:
-                return lesson
-        wanted = target.title_key
-        for lesson in lessons:
-            if lesson.title_key == wanted:
-                return lesson
-        for lesson in lessons:
-            if wanted and (lesson.title_key.startswith(wanted[:8]) or wanted.startswith(lesson.title_key[:8])):
-                return lesson
+        # 先按编号找。5.1/6.1 都叫“问题的引入”，按标题找会点回第一条。
+        if target.index:
+            for lesson in lessons:
+                if lesson.index == target.index:
+                    return lesson
+            return None
+        # 运行时视频必须有编号；不再用无编号标题进行模糊定位。
         return None
 
     @staticmethod

@@ -9,11 +9,11 @@ from typing import Optional
 
 import numpy as np
 
-from . import vision
-from .config import Config
-from .llm import LLMConfigError, LLMError, random_fallback, report_llm_fallback
-from .ocr import OcrEngine, sort_lines
-from .types import FatalError, OcrLine, QuizQuestion, Rect
+from autolesson import vision
+from autolesson.config import Config
+from autolesson.llm import LLMConfigError, LLMError, random_fallback, report_llm_fallback
+from autolesson.ocr import OcrEngine, sort_lines
+from autolesson.types import FatalError, OcrLine, QuizQuestion, Rect
 
 log = logging.getLogger("autolesson.quiz")
 

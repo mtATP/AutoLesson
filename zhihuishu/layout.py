@@ -6,9 +6,9 @@ from typing import Optional
 
 import numpy as np
 
-from . import vision
-from .config import Config
-from .types import OcrLine, Rect
+from autolesson import vision
+from autolesson.config import Config
+from autolesson.types import OcrLine, Rect
 
 log = logging.getLogger("autolesson.layout")
 

@@ -19,13 +19,13 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
-from . import vision
-from .config import Config
-from .llm import LLMConfigError, LLMError, random_fallback, report_llm_fallback
+from autolesson import vision
+from autolesson.config import Config
+from autolesson.llm import LLMConfigError, LLMError, random_fallback, report_llm_fallback
 from .layout import Layout
-from .ocr import OcrEngine, sort_lines
+from autolesson.ocr import OcrEngine, sort_lines
 from .panel import PanelNavigator, PanelScanner
-from .types import OcrLine, Rect, STATUS_COMPLETED
+from autolesson.types import OcrLine, Rect, STATUS_COMPLETED
 from .quiz import parse_quiz
 
 log = logging.getLogger("autolesson.practice")
@@ -1039,7 +1039,7 @@ class PracticePage:
 
     def _active_window_title(self) -> str:
         try:
-            from .platform_utils import get_active_window_title
+            from autolesson.platform_utils import get_active_window_title
 
             return get_active_window_title()
         except Exception:  # noqa: BLE001

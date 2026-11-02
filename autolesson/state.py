@@ -106,6 +106,16 @@ class State:
         key = lesson.key if isinstance(lesson, Lesson) else str(lesson)
         if key in self.lessons:
             return True
+        if isinstance(lesson, Lesson) and lesson.index:
+            # 只按编号判断是否同一视频。课程里“问题的引入”“综合案例”这类
+            # 标题会在不同章节重复；按标题匹配会让 5.1/5.10/6.1 被 4.1/4.6
+            # 的完成记录误伤，整段视频被跳过。
+            for meta in self.lessons.values():
+                if isinstance(meta, dict) and str(meta.get("index") or "").strip() == str(
+                    lesson.index
+                ).strip():
+                    return True
+            return False
         title = normalize_title(lesson.title) if isinstance(lesson, Lesson) else ""
         if title:
             for meta in self.lessons.values():
