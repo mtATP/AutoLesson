@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import itertools
 import logging
 import re
 import time
@@ -65,6 +67,7 @@ class FanyaWatcher:
         self.stop_event = stop_event
         self.mode = mode if mode in ("video", "practice", "auto") else "video"
         self.quiz_reader = VideoQuizReader(ocr)
+        self._video_quiz_attempts: dict[str, dict] = {}
         self.practice_solver = FanyaPracticeSolver(
             ocr,
             cfg,
@@ -619,78 +622,163 @@ class FanyaWatcher:
             self.log.debug("视频弹题识别失败: %s", exc)
             return None
 
+    @staticmethod
+    def _video_quiz_key(quiz: VideoQuiz) -> str:
+        raw = quiz.kind + "|" + _norm(quiz.question) + "|" + "|".join(
+            f"{k}.{_norm(v)}" for k, v in sorted(quiz.options.items())
+        )
+        return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()
+
+    @staticmethod
+    def _video_quiz_candidates(quiz: VideoQuiz, tried) -> list[tuple[str, ...]]:
+        """按单选全选项、多选 1..N 组合的顺序生成未尝试答案。"""
+        letters = sorted(quiz.options)
+        used = {tuple(sorted(x)) for x in tried}
+        out: list[tuple[str, ...]] = []
+        if quiz.kind == "多选题":
+            for size in range(1, len(letters) + 1):
+                for combo in itertools.combinations(letters, size):
+                    if tuple(sorted(combo)) not in used:
+                        out.append(tuple(sorted(combo)))
+        else:
+            for letter in letters:
+                if (letter,) not in used:
+                    out.append((letter,))
+        return out
+
+    def _select_video_quiz_options(
+        self, quiz: VideoQuiz, target: tuple[str, ...], attempt: dict
+    ) -> None:
+        target_set = set(target)
+        current = set(attempt.get("selected") or [])
+        if quiz.kind == "多选题":
+            for letter in sorted(current - target_set):
+                rect = quiz.option_rects.get(letter)
+                if rect is not None:
+                    self.mouse.click_rect(rect.expand(4), f"弹题取消 {letter}")
+                    time.sleep(0.35)
+            for letter in sorted(target_set - current):
+                rect = quiz.option_rects.get(letter)
+                if rect is not None:
+                    self.mouse.click_rect(rect.expand(4), f"弹题选择 {letter}")
+                    time.sleep(0.35)
+        else:
+            for letter in target:
+                rect = quiz.option_rects.get(letter)
+                if rect is not None:
+                    self.mouse.click_rect(rect.expand(4), f"弹题选择 {letter}")
+                    time.sleep(0.4)
+        attempt["selected"] = list(target)
+
     def _solve_video_quiz(self, quiz: VideoQuiz, item: FanyaItem) -> None:
         if quiz.continue_button is not None:
-            # 提交后“继续”一出现就点；选项可能还留在画面上，不能重新作答。
             self.log.info("视频弹题已提交，点击继续")
             self.mouse.click_rect(quiz.continue_button, "弹题继续")
             time.sleep(1.0)
             return
         if not quiz.options:
-            # 只有题型/提交按钮时不能盲点提交，否则可能交白卷。
-            # 保留弹题画面，等待下一轮增强 OCR 读到选项。
             self.log.warning("检测到视频弹题，但暂未读到选项，等待下一次识别（不盲点提交）")
             return
+        key = self._video_quiz_key(quiz)
+        attempt = self._video_quiz_attempts.setdefault(
+            key, {"tried": [], "selected": []}
+        )
         self.log.info(
             "视频弹题: %s %s 选项=%s",
             quiz.kind,
             quiz.question[:80],
             quiz.options,
         )
-        question = QuizQuestion(
-            kind=quiz.kind,
-            text=quiz.question,
-            options=quiz.options,
-            option_rects=quiz.option_rects,
-            dialog=quiz.dialog,
-            needs_vision=True,
-        )
-        letters: list[str] = []
-        if self.llm is not None and bool(getattr(self.cfg, "llm_ready", lambda: False)()):
-            try:
-                frame = self.screen.grab()
-                answer = self.llm.answer(
-                    question, image_bgr=quiz.dialog.crop(frame), auto_switch=True
-                )
-                letters = [x for x in answer.letters if x in quiz.options]
-                self.log.info(
-                    "视频弹题大模型答案: %s (%.2f) %s",
-                    answer.letters,
-                    answer.confidence,
-                    answer.reason[:80],
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.log.warning("视频弹题大模型失败: %s", exc)
-        if not letters:
-            letters = [sorted(quiz.options)[0]]
-            self.log.warning(
-                "视频弹题无有效大模型答案，默认选择 %s（有答错风险，请人工复核）",
-                letters[0],
-            )
-        targets = letters if quiz.kind == "多选题" else letters[:1]
-        for letter in targets:
-            rect = quiz.option_rects.get(letter)
-            if rect is not None:
-                self.mouse.click_rect(rect.expand(4), f"弹题选择 {letter}")
-                time.sleep(0.4)
-        if quiz.submit is not None:
-            self.mouse.click_rect(quiz.submit, "弹题提交")
+        # 先使用大模型答案；失败后依次遍历其余选项/组合，绝不重复同一答案。
+        if not attempt["tried"]:
+            letters: list[str] = []
+            if self.llm is not None and bool(getattr(self.cfg, "llm_ready", lambda: False)()):
+                try:
+                    frame = self.screen.grab()
+                    question = QuizQuestion(
+                        kind=quiz.kind,
+                        text=quiz.question,
+                        options=quiz.options,
+                        option_rects=quiz.option_rects,
+                        dialog=quiz.dialog,
+                        needs_vision=True,
+                    )
+                    answer = self.llm.answer(
+                        question, image_bgr=quiz.dialog.crop(frame), auto_switch=True
+                    )
+                    letters = [x for x in answer.letters if x in quiz.options]
+                    self.log.info(
+                        "视频弹题大模型答案: %s (%.2f) %s",
+                        answer.letters,
+                        answer.confidence,
+                        answer.reason[:80],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning("视频弹题大模型失败: %s", exc)
+            if not letters:
+                letters = [sorted(quiz.options)[0]]
+                self.log.warning("视频弹题无有效大模型答案，默认从 %s 开始尝试", letters[0])
+            target = tuple(sorted(set(letters if quiz.kind == "多选题" else letters[:1])))
         else:
-            self.log.warning("视频弹题没有读到提交按钮，尝试等待平台自动提交")
-        time.sleep(1.8)
-        after = self._read_video_quiz()
-        text = " ".join(line.text for line in (after.raw_lines if after else []))
-        wrong = "回答错误" in text
-        if self.state is not None:
-            self.state.note_quiz(wrong=wrong)
-        if after is not None and after.continue_button is not None:
-            self.mouse.click_rect(after.continue_button, "弹题继续")
-            time.sleep(1.0)
-            self.log.info(
-                "视频弹题处理完成: %s", "回答错误" if wrong else ("回答正确" if "回答正确" in text else "已继续")
-            )
-        else:
-            self.log.info("视频弹题已提交（未读到继续按钮，等待视频自行恢复）")
+            candidates = self._video_quiz_candidates(quiz, attempt["tried"])
+            if not candidates:
+                self.log.error("视频弹题所有答案组合均已尝试仍错误，停止重试: %s", quiz.question[:60])
+                return
+            target = candidates[0]
+        max_attempts = max(6, 1 + len(self._video_quiz_candidates(quiz, [])))
+        for index in range(max_attempts):
+            self._check_stop()
+            if not attempt["tried"]:
+                target = target
+            else:
+                candidates = self._video_quiz_candidates(quiz, attempt["tried"])
+                if not candidates:
+                    self.log.error("视频弹题答案组合用尽，停止: %s", quiz.question[:60])
+                    return
+                target = candidates[0]
+            self.log.info("视频弹题尝试第 %d 次: %s", index + 1, list(target))
+            self._select_video_quiz_options(quiz, tuple(target), attempt)
+            if quiz.submit is not None:
+                self.mouse.click_rect(quiz.submit, "弹题提交")
+            else:
+                self.log.warning("视频弹题没有读到提交按钮")
+                return
+            time.sleep(2.0)
+            after = self._read_video_quiz()
+            text = " ".join(line.text for line in (after.raw_lines if after else []))
+            wrong = any(word in text for word in ("回答错误", "答错", "答案错误"))
+            if self.state is not None:
+                self.state.note_quiz(wrong=wrong)
+            if after is not None and after.continue_button is not None:
+                self.mouse.click_rect(after.continue_button, "弹题继续")
+                self._video_quiz_attempts.pop(key, None)
+                time.sleep(1.0)
+                self.log.info("视频弹题回答正确，已继续")
+                return
+            attempt["tried"].append(tuple(target))
+            if wrong:
+                self.log.warning("视频弹题回答错误，切换下一个答案")
+                # 错误提示后选项仍在；用最新识别结果进入下一轮
+                if after is not None and after.options:
+                    quiz = after
+                time.sleep(0.6)
+                continue
+            # 没有继续、也没有明确错误：可能仍在处理，给平台一点时间
+            time.sleep(1.5)
+            after = self._read_video_quiz()
+            text = " ".join(line.text for line in (after.raw_lines if after else []))
+            if after is not None and after.continue_button is not None:
+                self.mouse.click_rect(after.continue_button, "弹题继续")
+                self._video_quiz_attempts.pop(key, None)
+                time.sleep(1.0)
+                self.log.info("视频弹题已继续")
+                return
+            if any(word in text for word in ("回答错误", "答错", "答案错误")):
+                self.log.warning("视频弹题回答错误，切换下一个答案")
+                continue
+            self.log.warning("视频弹题提交后状态未知，停止自动重试，等待下一轮识别")
+            return
+        self.log.error("视频弹题重试次数用尽，仍未继续: %s", quiz.question[:60])
 
     def watch_video(self, item: FanyaItem) -> None:
         quiz = self._read_video_quiz()
