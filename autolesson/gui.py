@@ -435,7 +435,9 @@ class App(tk.Tk):
         if self.proc is not None:
             messagebox.showwarning("正在运行", "请先停止当前任务再重新载入配置。")
             return
-        # 置顶小条也是 root 的 Toplevel 子窗口；重建界面时必须先清掉引用
+        # 置顶小条也是 root 的 Toplevel 子窗口；重建界面时必须先清掉引用，
+        # 但用户原本打开着的小条要在重建后恢复，不能当成“手动关闭”。
+        bar_was_visible = self._bar is not None and bool(self.bar_var.get())
         if self._bar is not None:
             self._hide_bar()
         self.data = self._load_raw()
@@ -447,6 +449,9 @@ class App(tk.Tk):
         self._build_log()
         self._refresh_modes()
         self.status_var.set("已重新载入配置")
+        if bar_was_visible:
+            self.bar_var.set(True)
+            self._show_bar()
 
     # ------------------------------------------------------------------ 日志
     def _build_log(self) -> None:
